@@ -97,6 +97,7 @@ export DEBUG=1
 DEBUG=1 .venv/bin/python manage.py check
 DEBUG=1 .venv/bin/python manage.py makemigrations --check --dry-run
 DEBUG=1 .venv/bin/python manage.py test
+node --test scripts/test_qr_login.cjs
 DEBUG=1 .venv/bin/python manage.py collectstatic --noinput
 sh -n update.sh
 ```

@@ -1,5 +1,6 @@
-const scannedPassword = new URLSearchParams(window.location.hash.slice(1)).get('password');
-if (scannedPassword !== null) {
+function signInFromQR() {
+  const scannedPassword = new URLSearchParams(window.location.hash.slice(1)).get('password');
+  if (scannedPassword === null) return;
   window.history.replaceState(null, '', window.location.pathname + window.location.search);
   const loginForm = document.querySelector('#login-form');
   if (/^[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{5}$/.test(scannedPassword)) {
@@ -11,6 +12,10 @@ if (scannedPassword !== null) {
     }
   }
 }
+// Safari can reuse an open tab or restore a page without running this script again.
+window.addEventListener('hashchange', signInFromQR);
+window.addEventListener('pageshow', signInFromQR);
+signInFromQR();
 
 document.querySelectorAll('form[data-confirm]').forEach(form => {
   form.addEventListener('submit', event => {
