@@ -25,13 +25,14 @@ def credential_pdf(users):
     pdf.setTitle('教會執事選舉登入憑證')
     width, height = A4
     margin = 24
-    card_w, card_h = (width - margin * 2) / 2, (height - margin * 2) / 4
+    card_w, card_h = (width - margin * 2) / 3, (height - margin * 2) / 4
     style = ParagraphStyle('card', fontName='NotoTC', fontSize=10, leading=14, autoLeading='max', wordWrap='CJK', textColor=colors.HexColor('#252132'))
+    instruction_style = ParagraphStyle('instructions', parent=style, fontSize=8, leading=10)
     for index, user in enumerate(users):
-        if index and index % 8 == 0:
+        if index and index % 12 == 0:
             pdf.showPage()
-        slot = index % 8
-        x, y = margin + (slot % 2) * card_w, height - margin - (slot // 2 + 1) * card_h
+        slot = index % 12
+        x, y = margin + (slot % 3) * card_w, height - margin - (slot // 3 + 1) * card_h
         pdf.setStrokeColor(colors.HexColor('#b5adbd'))
         pdf.setDash(3, 3)
         pdf.rect(x, y, card_w, card_h)
@@ -42,7 +43,7 @@ def credential_pdf(users):
                 f'<font size="19">密碼：{password}</font><br/>'
                 f'{escape(settings.PUBLIC_URL)}')
         paragraph = Paragraph(text, style)
-        text_h = card_h - 108
+        text_h = card_h - 96
         _, needed = paragraph.wrap(card_w - 26, text_h)
         if needed > text_h:
             compact = ParagraphStyle('compact', parent=style, fontSize=8, leading=11)
@@ -51,14 +52,14 @@ def credential_pdf(users):
         if needed > text_h:
             raise ValueError('憑證內容過長，請縮短網站網址或姓名。')
         paragraph.drawOn(pdf, x + 13, y + card_h - 12 - needed)
-        qr = QrCodeWidget(f'{settings.PUBLIC_URL}/#password={password}', barWidth=72, barHeight=72)
-        drawing = Drawing(72, 72)
+        qr = QrCodeWidget(f'{settings.PUBLIC_URL}/#password={password}', barWidth=60, barHeight=60)
+        drawing = Drawing(60, 60)
         drawing.add(qr)
         renderPDF.draw(drawing, pdf, x + 13, y + 12)
-        instructions = Paragraph('掃描 QR 碼即可登入，<br/>或開啟網址輸入密碼。<br/>最多選 10 位。<br/>請妥善保管憑證及 QR 碼，勿交予他人。', style)
-        _, needed = instructions.wrap(card_w - 110, 84)
-        if needed > 84:
+        instructions = Paragraph('掃描 QR 碼即可登入，<br/>或開啟網址輸入密碼。<br/>最多選 10 位。<br/>請妥善保管憑證及 QR 碼，勿交予他人。', instruction_style)
+        _, needed = instructions.wrap(card_w - 98, 72)
+        if needed > 72:
             raise ValueError('憑證說明過長。')
-        instructions.drawOn(pdf, x + 97, y + 96 - needed)
+        instructions.drawOn(pdf, x + 85, y + 84 - needed)
     pdf.save()
     return output.getvalue()

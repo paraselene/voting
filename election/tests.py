@@ -429,7 +429,7 @@ class VotingTests(TestCase):
 
     def test_pdf_all_selected_and_long_names(self):
         from pypdf import PdfReader
-        for _ in range(8):
+        for _ in range(12):
             create_identity('陳王李張劉林黃吳周徐' * 8)
         session = self.client.session
         session['identity'] = self.admin.pk
@@ -439,7 +439,7 @@ class VotingTests(TestCase):
         self.assertIn('no-store', response['Cache-Control'])
         reader = PdfReader(BytesIO(response.content))
         self.assertEqual(len(reader.pages), 2)
-        self.assertEqual(reader.pages[0].extract_text().count('登入憑證'), 8)
+        self.assertEqual(reader.pages[0].extract_text().count('登入憑證'), 12)
         self.assertEqual(reader.pages[1].extract_text().count('登入憑證'), 1)
         self.assertIn(self.voter.name, reader.pages[0].extract_text())
         self.assertIn(self.password, reader.pages[0].extract_text())
