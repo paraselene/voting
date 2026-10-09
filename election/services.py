@@ -94,10 +94,14 @@ def manage_election(action, value=''):
         election.is_open = True
     elif action == 'close':
         election.is_open = False
-    elif action == 'clear':
-        if value != '清除全部選票':
-            raise ValidationError('請輸入「清除全部選票」確認。')
+    elif action in ('clear', 'reset'):
+        confirmation = '清除全部資料' if action == 'reset' else '清除全部選票'
+        if value != confirmation:
+            raise ValidationError(f'請確認「{confirmation}」操作。')
         Ballot.objects.all().delete()
+        if action == 'reset':
+            Identity.objects.filter(is_admin=False).delete()
+            Candidate.objects.all().delete()
         election.is_open = False
         election.version += 1
     else:

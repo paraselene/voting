@@ -97,7 +97,7 @@ def dashboard(request):
             if action == 'user':
                 create_identity(request.POST.get('name', ''))
             else:
-                manage_election(action, request.POST.get('confirmation' if action == 'clear' else 'name', ''))
+                manage_election(action, request.POST.get('confirmation' if action in ('clear', 'reset') else 'name', ''))
         except ValidationError as exc:
             messages.error(request, ' '.join(exc.messages))
         else:

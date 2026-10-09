@@ -1,3 +1,10 @@
+document.querySelectorAll('form[data-confirm]').forEach(form => {
+  form.addEventListener('submit', event => {
+    if (!window.confirm(form.dataset.confirm)) event.preventDefault();
+  });
+  form.querySelector('button').disabled = false;
+});
+
 const form = document.querySelector('#vote-form');
 if (form) {
   const boxes = [...form.querySelectorAll('input[name="candidate"]')];

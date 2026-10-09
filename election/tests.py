@@ -12,7 +12,7 @@ from django.db import OperationalError, connections
 from django.test import Client, TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 
-from .models import Ballot, Candidate, Election, Identity, LoginAttempt
+from .models import Ballot, Candidate, Choice, Election, Identity, LoginAttempt
 from .services import ALPHABET, authenticate, create_identity, digest, manage_election, password_for, submit_ballot
 from .views import client_ip
 
@@ -92,6 +92,53 @@ class VotingTests(TestCase):
         manage_election('close')
         with self.assertRaises(ValidationError):
             manage_election('open')
+
+    def test_reset_requires_admin_confirmation_and_preserves_admin_logins(self):
+        other_admin, other_password = create_identity('另一位管理員', True)
+        submit_ballot(self.voter, [self.candidates[0].pk], 1)
+        fields = {'action': 'reset', 'confirmation': '清除全部資料'}
+        self.assertEqual(self.client.post('/manage/', fields).status_code, 403)
+        admin_client = Client()
+        admin_client.post('/', {'password': self.admin_password})
+        session_key = admin_client.session.session_key
+        response = admin_client.get('/manage/')
+        self.assertContains(response, '清除全部資料並保留管理員')
+        self.assertContains(response, 'data-confirm=')
+        self.assertContains(response, 'type="hidden" name="confirmation" value="清除全部資料"')
+        self.assertNotContains(response, '請輸入「清除全部資料」')
+        self.assertEqual(admin_client.get('/manage/', fields).status_code, 200)
+        admin_client.post('/manage/', {'action': 'reset', 'confirmation': 'wrong'})
+        self.assertTrue(Ballot.objects.exists())
+        self.assertTrue(Identity.objects.filter(pk=self.voter.pk).exists())
+        self.assertEqual(Candidate.objects.count(), 11)
+        self.assertEqual(Election.objects.get(pk=1).version, 1)
+        response = admin_client.post('/manage/', fields)
+        self.assertRedirects(response, '/manage/')
+        self.assertEqual(admin_client.session.session_key, session_key)
+        self.assertEqual(set(Identity.objects.values_list('pk', flat=True)), {self.admin.pk, other_admin.pk})
+        self.assertFalse(Ballot.objects.exists())
+        self.assertFalse(Choice.objects.exists())
+        self.assertFalse(Candidate.objects.exists())
+        election = Election.objects.get(pk=1)
+        self.assertFalse(election.is_open)
+        self.assertEqual(election.version, 2)
+        self.assertRedirects(self.client.get('/vote/'), '/')
+        self.assertIsNone(authenticate(self.password, '192.0.2.1')[0])
+        for admin, password in ((self.admin, self.admin_password), (other_admin, other_password)):
+            self.assertEqual(authenticate(password, '192.0.2.2')[0], admin)
+
+    def test_reset_rolls_back_on_deletion_failure(self):
+        submit_ballot(self.voter, [self.candidates[0].pk], 1)
+        with patch('election.services.Candidate.objects.all') as candidates:
+            candidates.return_value.delete.side_effect = OperationalError('database is locked')
+            with self.assertRaises(OperationalError):
+                manage_election('reset', '清除全部資料')
+        self.assertTrue(Identity.objects.filter(pk=self.voter.pk).exists())
+        self.assertEqual(Candidate.objects.count(), 11)
+        self.assertEqual(Ballot.objects.get(voter=self.voter).choices.count(), 1)
+        election = Election.objects.get(pk=1)
+        self.assertTrue(election.is_open)
+        self.assertEqual(election.version, 1)
 
     def test_roles_login_logout_and_cache(self):
         anonymous = Client()
