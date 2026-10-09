@@ -282,6 +282,34 @@ class VotingTests(TestCase):
         self.assertNotEqual(client.cookies['csrftoken'].value, token)
         self.assertEqual(client.post('/vote/', {'version': 1, 'blank': 'yes'}).status_code, 403)
 
+    def test_qr_login_switches_accounts_and_rotates_session(self):
+        client = Client(enforce_csrf_checks=True)
+        client.get('/')
+        token = client.cookies['csrftoken'].value
+        client.post('/', {'password': self.admin_password, 'csrfmiddlewaretoken': token})
+        self.assertEqual(client.session['identity'], self.admin.pk)
+        old_key = client.session.session_key
+        self.assertRedirects(client.get('/'), '/manage/')
+        response = client.get('/?qr=1')
+        self.assertContains(response, 'id="login-form"')
+        self.assertEqual(client.session['identity'], self.admin.pk)
+        self.assertEqual(client.post('/?qr=1', {'password': self.password}).status_code, 403)
+        token = client.cookies['csrftoken'].value
+        response = client.post('/?qr=1', {'password': self.password, 'csrfmiddlewaretoken': token})
+        self.assertRedirects(response, '/vote/')
+        self.assertEqual(client.session['identity'], self.voter.pk)
+        self.assertNotEqual(client.session.session_key, old_key)
+        self.assertNotEqual(client.cookies['csrftoken'].value, token)
+        other, password = create_identity('另一個帳戶')
+        client.get('/?qr=1')
+        token = client.cookies['csrftoken'].value
+        response = client.post('/?qr=1', {'password': '00000', 'csrfmiddlewaretoken': token})
+        self.assertContains(response, '密碼不正確')
+        self.assertEqual(client.session['identity'], self.voter.pk)
+        response = client.post('/?qr=1', {'password': password, 'csrfmiddlewaretoken': token})
+        self.assertRedirects(response, '/vote/')
+        self.assertEqual(client.session['identity'], other.pk)
+
     @override_settings(
         SECURE_SSL_REDIRECT=True,
         SESSION_COOKIE_SECURE=True,

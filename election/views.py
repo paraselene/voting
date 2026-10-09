@@ -47,7 +47,7 @@ def client_ip(request):
 @require_http_methods(['GET', 'POST'])
 def login(request):
     identity = Identity.objects.filter(pk=request.session.get('identity')).first()
-    if identity:
+    if identity and request.GET.get('qr') != '1':
         return redirect('dashboard' if identity.is_admin else 'vote')
     error = ''
     if request.method == 'POST':

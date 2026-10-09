@@ -2,9 +2,13 @@ const scannedPassword = new URLSearchParams(window.location.hash.slice(1)).get('
 if (scannedPassword !== null) {
   window.history.replaceState(null, '', window.location.pathname + window.location.search);
   const loginForm = document.querySelector('#login-form');
-  if (loginForm && /^[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{5}$/.test(scannedPassword)) {
-    loginForm.querySelector('input[name="password"]').value = scannedPassword;
-    loginForm.requestSubmit();
+  if (/^[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{5}$/.test(scannedPassword)) {
+    if (loginForm) {
+      loginForm.querySelector('input[name="password"]').value = scannedPassword;
+      loginForm.requestSubmit();
+    } else {
+      window.location.replace('/?qr=1#password=' + scannedPassword);
+    }
   }
 }
 
