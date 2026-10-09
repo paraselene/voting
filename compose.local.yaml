@@ -1,0 +1,15 @@
+# 獨立本機測試，不使用正式 .env 或外部代理網絡。
+services:
+  voting-web:
+    build: .
+    environment:
+      DEBUG: "1"
+      DATABASE_PATH: /data/db.sqlite3
+      ALLOWED_HOSTS: localhost,127.0.0.1,testserver
+      PUBLIC_URL: http://localhost:18000
+    ports:
+      - "127.0.0.1:18000:8000"
+    volumes:
+      - ./data/local-docker:/data
+      - ./fonts:/app/fonts:ro
+    restart: unless-stopped
