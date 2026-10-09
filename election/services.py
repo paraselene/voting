@@ -5,8 +5,10 @@ from datetime import timedelta
 
 from cryptography.fernet import Fernet
 from django.conf import settings
+from django.contrib.sessions.models import Session
 from django.core.exceptions import ValidationError
-from django.db import transaction
+from django.core.management.color import no_style
+from django.db import connection, transaction
 from django.utils import timezone
 
 from .models import Ballot, Candidate, Choice, Election, Identity, LoginAttempt
@@ -102,6 +104,15 @@ def manage_election(action, value=''):
         if action == 'reset':
             Identity.objects.filter(is_admin=False).delete()
             Candidate.objects.all().delete()
+            LoginAttempt.objects.all().delete()
+            admin_ids = set(Identity.objects.values_list('pk', flat=True))
+            for session in Session.objects.iterator():
+                if session.get_decoded().get('identity') not in admin_ids:
+                    session.delete()
+            sequences = [{'table': model._meta.db_table} for model in (Identity, Candidate, Ballot, Choice)]
+            with connection.cursor() as cursor:
+                for sql in connection.ops.sequence_reset_by_name_sql(no_style(), sequences):
+                    cursor.execute(sql)
         election.is_open = False
         election.version += 1
     else:

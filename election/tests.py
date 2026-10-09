@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from django.core.exceptions import ValidationError
+from django.contrib.sessions.models import Session
 from django.core.management import call_command
 from django.db import OperationalError, connections
 from django.test import Client, TestCase, TransactionTestCase, override_settings
@@ -139,6 +140,47 @@ class VotingTests(TestCase):
         election = Election.objects.get(pk=1)
         self.assertTrue(election.is_open)
         self.assertEqual(election.version, 1)
+
+    def test_reset_restarts_ids_and_revokes_sessions_before_id_reuse(self):
+        old_voter, password = create_identity('將刪除的用戶')
+        old_client = Client()
+        old_client.post('/', {'password': password})
+        old_session_key = old_client.session.session_key
+        # Advance every sequence beyond the rows that will remain after reset.
+        create_identity('另一位用戶')
+        submit_ballot(self.voter, [self.candidates[0].pk], 1)
+        submit_ballot(old_voter, [self.candidates[1].pk], 1)
+        authenticate('00000', '192.0.2.1')
+        self.assertTrue(LoginAttempt.objects.exists())
+        manage_election('reset', '清除全部資料')
+        self.assertFalse(LoginAttempt.objects.exists())
+        self.assertFalse(Session.objects.filter(session_key=old_session_key).exists())
+        voter, _ = create_identity('新用戶')
+        self.assertEqual(voter.pk, self.admin.pk + 1)
+        self.assertEqual(voter.pk, old_voter.pk)
+        self.assertRedirects(old_client.get('/vote/'), '/')
+        candidate = Candidate.objects.create(name='新候選人')
+        self.assertEqual(candidate.pk, 1)
+        manage_election('open')
+        with self.assertRaises(ValidationError):
+            submit_ballot(voter, [candidate.pk], 1)
+        ballot = submit_ballot(voter, [candidate.pk], 2)
+        self.assertEqual(ballot.pk, 1)
+        self.assertEqual(Choice.objects.get(ballot=ballot).pk, 1)
+
+    def test_reset_rolls_back_if_sequence_reset_fails(self):
+        submit_ballot(self.voter, [self.candidates[0].pk], 1)
+        session_key = self.client.session.session_key
+        authenticate('00000', '192.0.2.1')
+        with patch('election.services.connection.ops.sequence_reset_by_name_sql', side_effect=OperationalError('reset failed')):
+            with self.assertRaises(OperationalError):
+                manage_election('reset', '清除全部資料')
+        self.assertTrue(Session.objects.filter(session_key=session_key).exists())
+        self.assertTrue(LoginAttempt.objects.exists())
+        self.assertTrue(Identity.objects.filter(pk=self.voter.pk).exists())
+        self.assertEqual(Candidate.objects.count(), 11)
+        self.assertEqual(Ballot.objects.get(voter=self.voter).choices.count(), 1)
+        self.assertEqual(Election.objects.get(pk=1).version, 1)
 
     def test_roles_login_logout_and_cache(self):
         anonymous = Client()
