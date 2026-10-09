@@ -83,13 +83,17 @@ def submit_ballot(voter, selected, version, blank_confirmed=False):
 @transaction.atomic
 def manage_election(action, value=''):
     election = Election.objects.get(pk=1)
-    if action == 'candidate':
-        if Ballot.objects.exists():
+    if action in ('candidate', 'user'):
+        if action == 'candidate' and Ballot.objects.exists():
             raise ValidationError('已有選票，候選人名單已鎖定。')
-        value = value.strip()
-        if not value or len(value) > 80:
-            raise ValidationError('姓名須為 1 至 80 字元。')
-        Candidate.objects.create(name=value)
+        names = [name.strip() for name in value.split(',')]
+        if any(not name or len(name) > 80 for name in names):
+            raise ValidationError('每個姓名須為 1 至 80 字元，以逗號分隔，不可留空。')
+        if action == 'candidate':
+            Candidate.objects.bulk_create([Candidate(name=name) for name in names])
+        else:
+            for name in names:
+                create_identity(name)
     elif action == 'open':
         if not Candidate.objects.exists():
             raise ValidationError('至少需要一位候選人才可開放。')

@@ -15,7 +15,7 @@ from reportlab.pdfbase.ttfonts import TTFError
 
 from .models import Ballot, Candidate, Election, Identity
 from .pdf import credential_pdf
-from .services import authenticate, create_identity, manage_election, password_for, submit_ballot
+from .services import authenticate, manage_election, password_for, submit_ballot
 
 
 def access(admin=False):
@@ -94,10 +94,7 @@ def dashboard(request):
     if request.method == 'POST':
         try:
             action = request.POST.get('action')
-            if action == 'user':
-                create_identity(request.POST.get('name', ''))
-            else:
-                manage_election(action, request.POST.get('confirmation' if action in ('clear', 'reset') else 'name', ''))
+            manage_election(action, request.POST.get('confirmation' if action in ('clear', 'reset') else 'name', ''))
         except ValidationError as exc:
             messages.error(request, ' '.join(exc.messages))
         else:

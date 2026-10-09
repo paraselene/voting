@@ -94,6 +94,48 @@ class VotingTests(TestCase):
         with self.assertRaises(ValidationError):
             manage_election('open')
 
+    def test_batch_create_users_and_candidates(self):
+        client = Client()
+        client.post('/', {'password': self.admin_password})
+        names = ['陳大文', '李小明', '王小華']
+        for action, model in (('user', Identity), ('candidate', Candidate)):
+            with self.subTest(action=action):
+                response = client.post('/manage/', {'action': action, 'name': ' 陳大文,李小明, 王小華 '})
+                self.assertRedirects(response, '/manage/')
+                self.assertEqual(list(model.objects.filter(name__in=names).values_list('name', flat=True)), names)
+        users = list(Identity.objects.filter(name__in=names))
+        self.assertEqual(len({password_for(user) for user in users}), 3)
+        for user in users:
+            self.assertFalse(user.is_admin)
+            self.assertEqual(authenticate(password_for(user), '192.0.2.1')[0], user)
+        submit_ballot(self.voter, [], 1, True)
+        response = client.post('/manage/', {'action': 'candidate', 'name': '鎖定一,鎖定二'}, follow=True)
+        self.assertContains(response, '已有選票，候選人名單已鎖定。')
+        self.assertFalse(Candidate.objects.filter(name__startswith='鎖定').exists())
+
+    def test_invalid_batch_creates_nothing(self):
+        client = Client()
+        client.post('/', {'password': self.admin_password})
+        for action, model in (('user', Identity), ('candidate', Candidate)):
+            for value in ('', '有效姓名,', ',有效姓名', '有效姓名, ,另一位', '有效姓名,' + '長' * 81):
+                with self.subTest(action=action, value=value):
+                    count = model.objects.count()
+                    response = client.post('/manage/', {'action': action, 'name': value}, follow=True)
+                    self.assertContains(response, '每個姓名須為 1 至 80 字元')
+                    self.assertEqual(model.objects.count(), count)
+
+    def test_batch_users_roll_back_if_creation_fails(self):
+        count = Identity.objects.count()
+        with patch('election.services.create_identity', wraps=create_identity) as create:
+            def create_or_fail(name):
+                if name == '失敗用戶':
+                    raise ValidationError('建立失敗')
+                return create_identity(name)
+            create.side_effect = create_or_fail
+            with self.assertRaises(ValidationError):
+                manage_election('user', '暫存用戶,失敗用戶')
+        self.assertEqual(Identity.objects.count(), count)
+
     def test_reset_requires_admin_confirmation_and_preserves_admin_logins(self):
         other_admin, other_password = create_identity('另一位管理員', True)
         submit_ballot(self.voter, [self.candidates[0].pk], 1)
