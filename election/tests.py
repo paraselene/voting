@@ -124,6 +124,29 @@ class VotingTests(TestCase):
         self.assertNotEqual(client.cookies['csrftoken'].value, token)
         self.assertEqual(client.post('/vote/', {'version': 1, 'blank': 'yes'}).status_code, 403)
 
+    @override_settings(
+        SECURE_SSL_REDIRECT=True,
+        SESSION_COOKIE_SECURE=True,
+        CSRF_COOKIE_SECURE=True,
+        ALLOWED_HOSTS=['vote.hcmc.nz'],
+        CSRF_TRUSTED_ORIGINS=['https://vote.hcmc.nz'],
+    )
+    def test_https_login_referrer_policy_and_csrf(self):
+        client = Client(enforce_csrf_checks=True)
+        host = {'HTTP_HOST': 'vote.hcmc.nz'}
+        response = client.get('/', secure=True, **host)
+        self.assertEqual(response['Referrer-Policy'], 'same-origin')
+        token = client.cookies['csrftoken'].value
+        fields = {'password': self.admin_password, 'csrfmiddlewaretoken': token}
+        # Browsers must still provide a trusted origin or HTTPS referer.
+        self.assertEqual(client.post('/', fields, secure=True, **host).status_code, 403)
+        self.assertEqual(client.post('/', fields, secure=True, HTTP_ORIGIN='null', **host).status_code, 403)
+        self.assertEqual(client.post('/', fields, secure=True, HTTP_ORIGIN='https://untrusted.example', **host).status_code, 403)
+        response = client.post('/', fields, secure=True, HTTP_REFERER='https://vote.hcmc.nz/', **host)
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response['Location'], '/manage/')
+        self.assertTrue(client.cookies['sessionid']['secure'])
+
     def test_throttle_shared_in_database_and_expiry(self):
         for _ in range(6):
             self.assertIsNone(authenticate('00000', '192.0.2.1')[0])

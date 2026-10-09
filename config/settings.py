@@ -49,7 +49,8 @@ SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 SECURE_SSL_REDIRECT = not DEBUG and not BUILD_STATIC
 SECURE_HSTS_SECONDS = 31536000 if not DEBUG else 0
 SECURE_CONTENT_TYPE_NOSNIFF = True
-SECURE_REFERRER_POLICY = 'no-referrer'
+# HTTPS CSRF checks require origin/referer headers on same-site forms.
+SECURE_REFERRER_POLICY = 'same-origin'
 PDF_FONT_PATH = os.environ.get('PDF_FONT_PATH', str(BASE_DIR / 'fonts/NotoSansTC-Regular.ttf'))
 TRUSTED_PROXY_IPS = os.environ.get('TRUSTED_PROXY_IPS', '').split(',')
 CSRF_FAILURE_VIEW = 'election.views.csrf_failure'
