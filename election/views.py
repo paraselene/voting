@@ -103,17 +103,22 @@ def dashboard(request):
     with transaction.atomic():
         election = Election.objects.get(pk=1)
         users = list(Identity.objects.filter(is_admin=False).annotate(ballot_count=Count('ballot')))
-        results = list(Candidate.objects.annotate(votes=Count('choice')).order_by('-votes', 'id'))
+        candidates = Candidate.objects.all()
+        if not election.is_open:
+            candidates = candidates.annotate(votes=Count('choice')).order_by('-votes', 'id')
+        results = list(candidates)
         voted = Ballot.objects.count()
-        blank = Ballot.objects.annotate(total=Count('choices')).filter(total=0).count()
-    last_votes, rank = None, 0
-    for position, candidate in enumerate(results, 1):
-        if candidate.votes != last_votes:
-            rank = position
-        candidate.rank = rank
-        last_votes = candidate.votes
+        blank = None if election.is_open else Ballot.objects.annotate(total=Count('choices')).filter(total=0).count()
+    if not election.is_open:
+        last_votes, rank = None, 0
+        for position, candidate in enumerate(results, 1):
+            if candidate.votes != last_votes:
+                rank = position
+            candidate.rank = rank
+            last_votes = candidate.votes
     for user in users:
-        user.password_display = password_for(user)
+        if str(user.pk) == request.GET.get('reveal'):
+            user.password_display = password_for(user)
     return render(request, 'election/dashboard.html', {'identity': request.identity, 'election': election, 'users': users, 'results': results, 'voted': voted, 'blank': blank, 'total': len(users), 'unvoted': len(users) - voted})
 
 

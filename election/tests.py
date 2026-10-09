@@ -240,6 +240,33 @@ class VotingTests(TestCase):
         anonymous.post('/logout/')
         self.assertEqual(anonymous.get('/manage/').status_code, 302)
 
+    def test_dashboard_reveals_only_one_password_on_request(self):
+        other, other_password = create_identity('另一位用戶')
+        client = Client()
+        client.post('/', {'password': self.admin_password})
+        with patch('election.views.password_for', wraps=password_for) as decrypt:
+            response = client.get('/manage/')
+            decrypt.assert_not_called()
+            self.assertFalse(any(hasattr(user, 'password_display') for user in response.context['users']))
+            self.assertNotContains(response, f'<code>{self.password}</code>')
+            self.assertNotContains(response, f'<code>{other_password}</code>')
+            self.assertContains(response, '顯示密碼')
+            response = client.get('/manage/', {'reveal': self.voter.pk})
+            self.assertEqual(decrypt.call_count, 1)
+            self.assertContains(response, f'<code>{self.password}</code>')
+            self.assertNotContains(response, f'<code>{other_password}</code>')
+            self.assertContains(response, '隱藏密碼')
+            response = client.get('/manage/', {'reveal': other.pk})
+            self.assertContains(response, f'<code>{other_password}</code>')
+            self.assertNotContains(response, f'<code>{self.password}</code>')
+            for reveal in ('', 'bad', str(self.admin.pk), '999999999999999999999999'):
+                response = client.get('/manage/', {'reveal': reveal})
+                self.assertFalse(any(hasattr(user, 'password_display') for user in response.context['users']))
+        self.assertIn('no-store', response['Cache-Control'])
+        self.assertEqual(self.client.get('/manage/', {'reveal': other.pk}).status_code, 403)
+        response = Client().get('/manage/', {'reveal': self.voter.pk})
+        self.assertEqual(response.status_code, 302)
+
     def test_csrf_and_session_rotation(self):
         client = Client(enforce_csrf_checks=True)
         response = client.post('/', {'password': self.password})
@@ -304,6 +331,25 @@ class VotingTests(TestCase):
         session = self.client.session
         session['identity'] = self.admin.pk
         session.save()
+        for action in ('open', 'close', 'open'):
+            manage_election(action)
+            response = self.client.get('/manage/')
+            self.assertFalse(any(hasattr(user, 'selected') for user in response.context['users']))
+            if action == 'open':
+                self.assertEqual((response.context['total'], response.context['voted'], response.context['unvoted']), (2, 2, 0))
+                self.assertIsNone(response.context['blank'])
+                self.assertFalse(any(hasattr(candidate, 'votes') or hasattr(candidate, 'rank') for candidate in response.context['results']))
+                self.assertEqual([candidate.pk for candidate in response.context['results']], [candidate.pk for candidate in self.candidates])
+                self.assertNotContains(response, '<th>票數</th>')
+                self.assertNotContains(response, '<th>名次</th>')
+                self.assertNotContains(response, '空白票')
+                self.assertContains(response, '投票結束後才顯示票數及名次。')
+            else:
+                self.assertContains(response, '<th>票數</th>')
+                self.assertContains(response, '<th>名次</th>')
+                self.assertContains(response, '空白票')
+                self.assertEqual([(c.votes, c.rank) for c in response.context['results'][:3]], [(1, 1), (1, 1), (0, 3)])
+        manage_election('close')
         response = self.client.get('/manage/')
         self.assertEqual((response.context['total'], response.context['voted'], response.context['unvoted'], response.context['blank']), (2, 2, 0, 1))
         self.assertEqual([(c.votes, c.rank) for c in response.context['results'][:3]], [(1, 1), (1, 1), (0, 3)])
