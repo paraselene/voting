@@ -2,6 +2,9 @@ from io import BytesIO
 from xml.sax.saxutils import escape
 
 from django.conf import settings
+from reportlab.graphics import renderPDF
+from reportlab.graphics.barcode.qr import QrCodeWidget
+from reportlab.graphics.shapes import Drawing
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle
@@ -32,21 +35,29 @@ def credential_pdf(users):
         pdf.setDash(3, 3)
         pdf.rect(x, y, card_w, card_h)
         pdf.setDash()
+        password = password_for(user)
         text = ('教會執事選舉 · 登入憑證<br/>'
                 f'姓名：{escape(user.name)}（#{user.pk}）<br/>'
-                f'<font size="19">密碼：{password_for(user)}</font><br/><br/>'
-                f'{escape(settings.PUBLIC_URL)}<br/>'
-                '開啟以上網址，只需輸入密碼登入。<br/>'
-                '英文字母不分大小寫；最多選 10 位。<br/>'
-                '請妥善保管憑證，勿交予他人。')
+                f'<font size="19">密碼：{password}</font><br/>'
+                f'{escape(settings.PUBLIC_URL)}')
         paragraph = Paragraph(text, style)
-        _, needed = paragraph.wrap(card_w - 26, card_h - 24)
-        if needed > card_h - 24:
+        text_h = card_h - 108
+        _, needed = paragraph.wrap(card_w - 26, text_h)
+        if needed > text_h:
             compact = ParagraphStyle('compact', parent=style, fontSize=8, leading=11)
             paragraph = Paragraph(text, compact)
-            _, needed = paragraph.wrap(card_w - 26, card_h - 24)
-        if needed > card_h - 24:
+            _, needed = paragraph.wrap(card_w - 26, text_h)
+        if needed > text_h:
             raise ValueError('憑證內容過長，請縮短網站網址或姓名。')
         paragraph.drawOn(pdf, x + 13, y + card_h - 12 - needed)
+        qr = QrCodeWidget(f'{settings.PUBLIC_URL}/#password={password}', barWidth=72, barHeight=72)
+        drawing = Drawing(72, 72)
+        drawing.add(qr)
+        renderPDF.draw(drawing, pdf, x + 13, y + 12)
+        instructions = Paragraph('掃描 QR 碼即可登入，<br/>或開啟網址輸入密碼。<br/>最多選 10 位。<br/>請妥善保管憑證及 QR 碼，勿交予他人。', style)
+        _, needed = instructions.wrap(card_w - 110, 84)
+        if needed > 84:
+            raise ValueError('憑證說明過長。')
+        instructions.drawOn(pdf, x + 97, y + 96 - needed)
     pdf.save()
     return output.getvalue()

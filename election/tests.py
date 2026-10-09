@@ -364,6 +364,18 @@ class VotingTests(TestCase):
         self.assertEqual(list(Ballot.objects.get(voter=self.voter).choices.values_list('pk', flat=True)), [int(selected[0])])
         self.assertContains(self.client.post('/vote/', {'candidate': 'bad', 'version': 1}), '候選人資料無效')
 
+    @override_settings(PUBLIC_URL='https://vote.hcmc.nz')
+    def test_pdf_qr_matches_each_users_login_credential(self):
+        from reportlab.graphics.barcode.qr import QrCodeWidget
+        from .pdf import credential_pdf
+        other, password = create_identity('另一位用戶')
+        with patch('election.pdf.QrCodeWidget', wraps=QrCodeWidget) as qr:
+            credential_pdf([self.voter, other])
+        self.assertEqual([call.args[0] for call in qr.call_args_list], [
+            f'https://vote.hcmc.nz/#password={self.password}',
+            f'https://vote.hcmc.nz/#password={password}',
+        ])
+
     def test_pdf_all_selected_and_long_names(self):
         from pypdf import PdfReader
         for _ in range(8):
