@@ -13,10 +13,11 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 from reportlab.platypus import Paragraph
 
-from .services import password_for
+from .services import password_for, voter_numbers
 
 
 def credential_pdf(users):
+    numbers = voter_numbers()
     if 'NotoTC' not in pdfmetrics.getRegisteredFontNames():
         pdfmetrics.registerFont(TTFont('NotoTC', settings.PDF_FONT_PATH))
     output = BytesIO()
@@ -37,7 +38,7 @@ def credential_pdf(users):
         pdf.setDash()
         password = password_for(user)
         text = ('教會執事選舉 · 登入憑證<br/>'
-                f'姓名：{escape(user.name)}（#{user.pk}）<br/>'
+                f'姓名：{escape(user.name)}（#{numbers[user.pk]}）<br/>'
                 f'<font size="19">密碼：{password}</font><br/>'
                 f'{escape(settings.PUBLIC_URL)}')
         paragraph = Paragraph(text, style)

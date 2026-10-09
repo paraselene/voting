@@ -24,6 +24,10 @@ def password_for(identity):
     return Fernet(settings.PASSWORD_ENCRYPTION_KEY.encode()).decrypt(identity.encrypted_password.encode()).decode()
 
 
+def voter_numbers():
+    return {pk: number for number, pk in enumerate(Identity.objects.filter(is_admin=False).values_list('pk', flat=True), 1)}
+
+
 @transaction.atomic
 def create_identity(name, is_admin=False):
     name = name.strip()

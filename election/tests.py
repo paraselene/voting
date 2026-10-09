@@ -392,6 +392,29 @@ class VotingTests(TestCase):
         self.assertEqual(list(Ballot.objects.get(voter=self.voter).choices.values_list('pk', flat=True)), [int(selected[0])])
         self.assertContains(self.client.post('/vote/', {'candidate': 'bad', 'version': 1}), '候選人資料無效')
 
+    def test_display_numbers_start_at_one_and_match_selected_pdf(self):
+        from pypdf import PdfReader
+        manage_election('reset', '清除全部資料')
+        first, password = create_identity('第一位')
+        create_identity('額外管理員', True)
+        second, _ = create_identity('第二位')
+        self.assertGreater(first.pk, 1)
+        client = Client()
+        client.post('/', {'password': self.admin_password})
+        response = client.get('/manage/')
+        self.assertEqual([(user.pk, user.display_number) for user in response.context['users']], [(first.pk, 1), (second.pk, 2)])
+        self.assertContains(response, '編號 1')
+        self.assertContains(response, '編號 2')
+        self.assertContains(response, f'name="users" value="{first.pk}"')
+        for ids, expected in (([first.pk, second.pk], ['第一位（#1）', '第二位（#2）']), ([second.pk], ['第二位（#2）'])):
+            response = client.post('/credentials/', {'scope': 'selected', 'users': ids})
+            text = PdfReader(BytesIO(response.content)).pages[0].extract_text()
+            for name in expected:
+                self.assertIn(name, text)
+        voter_client = Client()
+        voter_client.post('/', {'password': password})
+        self.assertContains(voter_client.get('/vote/'), '第一位 · #1')
+
     @override_settings(PUBLIC_URL='https://vote.hcmc.nz')
     def test_pdf_qr_matches_each_users_login_credential(self):
         from reportlab.graphics.barcode.qr import QrCodeWidget

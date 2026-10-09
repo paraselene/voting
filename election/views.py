@@ -15,7 +15,7 @@ from reportlab.pdfbase.ttfonts import TTFError
 
 from .models import Ballot, Candidate, Election, Identity
 from .pdf import credential_pdf
-from .services import authenticate, manage_election, password_for, submit_ballot
+from .services import authenticate, manage_election, password_for, submit_ballot, voter_numbers
 
 
 def access(admin=False):
@@ -83,6 +83,7 @@ def vote(request):
         ballot = Ballot.objects.filter(voter=request.identity).first()
         selected = set(ballot.choices.values_list('pk', flat=True)) if ballot else set()
         candidates = list(Candidate.objects.all())
+        request.identity.display_number = voter_numbers()[request.identity.pk]
     if error and str(election.version) == request.POST.get('version') and election.is_open:
         selected = {int(value) for value in request.POST.getlist('candidate') if value.isdecimal() and len(value) < 12}
     return render(request, 'election/vote.html', {'identity': request.identity, 'election': election, 'ballot': ballot, 'selected': selected, 'candidates': candidates, 'error': error})
@@ -116,7 +117,8 @@ def dashboard(request):
                 rank = position
             candidate.rank = rank
             last_votes = candidate.votes
-    for user in users:
+    for number, user in enumerate(users, 1):
+        user.display_number = number
         if str(user.pk) == request.GET.get('reveal'):
             user.password_display = password_for(user)
     return render(request, 'election/dashboard.html', {'identity': request.identity, 'election': election, 'users': users, 'results': results, 'voted': voted, 'blank': blank, 'total': len(users), 'unvoted': len(users) - voted})
