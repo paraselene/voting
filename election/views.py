@@ -80,11 +80,12 @@ def vote(request):
             return redirect('vote')
     with transaction.atomic():
         election = Election.objects.get(pk=1)
+        request.identity.refresh_from_db(fields=['is_active'])
         ballot = Ballot.objects.filter(voter=request.identity).first()
         selected = set(ballot.choices.values_list('pk', flat=True)) if ballot else set()
-        candidates = list(Candidate.objects.all())
+        candidates = list(Candidate.objects.filter(is_active=True))
         request.identity.display_number = voter_numbers()[request.identity.pk]
-    if error and str(election.version) == request.POST.get('version') and election.is_open:
+    if error and str(election.version) == request.POST.get('version') and election.is_open and request.identity.is_active:
         selected = {int(value) for value in request.POST.getlist('candidate') if value.isdecimal() and len(value) < 12}
     return render(request, 'election/vote.html', {'identity': request.identity, 'election': election, 'ballot': ballot, 'selected': selected, 'candidates': candidates, 'error': error})
 
@@ -95,7 +96,11 @@ def dashboard(request):
     if request.method == 'POST':
         try:
             action = request.POST.get('action')
-            manage_election(action, request.POST.get('confirmation' if action in ('clear', 'reset') else 'name', ''))
+            if action in ('enable_user', 'disable_user', 'enable_candidate', 'disable_candidate'):
+                field = 'target'
+            else:
+                field = 'confirmation' if action in ('clear', 'reset') else 'name'
+            manage_election(action, request.POST.get(field, ''))
         except ValidationError as exc:
             messages.error(request, ' '.join(exc.messages))
         else:
@@ -106,13 +111,15 @@ def dashboard(request):
         users = list(Identity.objects.filter(is_admin=False).annotate(ballot_count=Count('ballot')))
         candidates = Candidate.objects.all()
         if not election.is_open:
-            candidates = candidates.annotate(votes=Count('choice')).order_by('-votes', 'id')
+            candidates = candidates.annotate(votes=Count('choice')).order_by('-is_active', '-votes', 'id')
         results = list(candidates)
         voted = Ballot.objects.count()
         blank = None if election.is_open else Ballot.objects.annotate(total=Count('choices')).filter(total=0).count()
     if not election.is_open:
         last_votes, rank = None, 0
         for position, candidate in enumerate(results, 1):
+            if not candidate.is_active:
+                continue
             if candidate.votes != last_votes:
                 rank = position
             candidate.rank = rank

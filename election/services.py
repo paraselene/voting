@@ -63,8 +63,13 @@ def authenticate(password, ip):
 @transaction.atomic
 def submit_ballot(voter, selected, version, blank_confirmed=False):
     election = Election.objects.get(pk=1)
+    voter = Identity.objects.filter(pk=voter.pk).first()
+    if voter is None:
+        raise ValidationError('用戶資料無效。')
     if voter.is_admin:
         raise ValidationError('管理員不能投票。')
+    if not voter.is_active:
+        raise ValidationError('你的投票權限已停用，仍可查看已提交的選票。')
     if str(election.version) != str(version):
         raise ValidationError('投票資料已重設，請重新載入頁面。')
     if not election.is_open:
@@ -73,7 +78,7 @@ def submit_ballot(voter, selected, version, blank_confirmed=False):
         ids = [int(value) for value in selected]
     except (ValueError, TypeError):
         raise ValidationError('候選人資料無效。') from None
-    if len(ids) > 10 or len(ids) != len(set(ids)) or Candidate.objects.filter(pk__in=ids).count() != len(ids):
+    if len(ids) > 10 or len(ids) != len(set(ids)) or Candidate.objects.filter(pk__in=ids, is_active=True).count() != len(ids):
         raise ValidationError('請選擇最多 10 位有效候選人，不可重複。')
     if not ids and not blank_confirmed:
         raise ValidationError('提交空白票前，請勾選確認。')
@@ -98,9 +103,21 @@ def manage_election(action, value=''):
         else:
             for name in names:
                 create_identity(name)
+    elif action in ('enable_user', 'disable_user', 'enable_candidate', 'disable_candidate'):
+        if not value.isdecimal() or len(value) > 12:
+            raise ValidationError('啟用／停用對象無效。')
+        is_candidate = action.endswith('_candidate')
+        targets = Candidate.objects.all() if is_candidate else Identity.objects.filter(is_admin=False)
+        target = targets.filter(pk=value).first()
+        if target is None:
+            raise ValidationError('啟用／停用對象無效，管理員帳戶不能停用。')
+        if is_candidate and Ballot.objects.exists():
+            raise ValidationError('已有選票，候選人名單及啟用狀態已鎖定。')
+        target.is_active = action.startswith('enable_')
+        target.save(update_fields=['is_active'])
     elif action == 'open':
-        if not Candidate.objects.exists():
-            raise ValidationError('至少需要一位候選人才可開放。')
+        if not Candidate.objects.filter(is_active=True).exists():
+            raise ValidationError('至少需要一位已啟用候選人才可開放。')
         election.is_open = True
     elif action == 'close':
         election.is_open = False

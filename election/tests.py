@@ -9,7 +9,7 @@ from unittest.mock import patch
 from django.core.exceptions import ValidationError
 from django.contrib.sessions.models import Session
 from django.core.management import call_command
-from django.db import OperationalError, connections
+from django.db import OperationalError, connections, transaction
 from django.test import Client, TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 
@@ -93,6 +93,175 @@ class VotingTests(TestCase):
         manage_election('close')
         with self.assertRaises(ValidationError):
             manage_election('open')
+
+    def test_status_actions_require_admin_post_and_csrf(self):
+        client = Client(enforce_csrf_checks=True)
+        client.get('/')
+        client.post('/', {'password': self.admin_password, 'csrfmiddlewaretoken': client.cookies['csrftoken'].value})
+        for action, target in (('disable_user', self.voter), ('disable_candidate', self.candidates[0])):
+            fields = {'action': action, 'target': target.pk}
+            self.assertRedirects(Client().post('/manage/', fields), '/')
+            self.assertEqual(self.client.post('/manage/', fields).status_code, 403)
+            self.assertEqual(client.post('/manage/', fields).status_code, 403)
+            client.get('/manage/', fields)
+            target.refresh_from_db()
+            self.assertTrue(target.is_active)
+            fields['csrfmiddlewaretoken'] = client.cookies['csrftoken'].value
+            self.assertRedirects(client.post('/manage/', fields), '/manage/')
+            target.refresh_from_db()
+            self.assertFalse(target.is_active)
+            fields['action'] = action.replace('disable_', 'enable_')
+            self.assertRedirects(client.post('/manage/', fields), '/manage/')
+            target.refresh_from_db()
+            self.assertTrue(target.is_active)
+
+    def test_invalid_status_targets_and_admin_protection(self):
+        client = Client()
+        client.post('/', {'password': self.admin_password})
+        for action in ('enable_user', 'disable_user', 'enable_candidate', 'disable_candidate'):
+            for target in ('', 'bad', '-1', '0', '999999', '9' * 13):
+                with self.subTest(action=action, target=target):
+                    response = client.post('/manage/', {'action': action, 'target': target}, follow=True)
+                    self.assertContains(response, '啟用／停用對象無效')
+        for action in ('enable_user', 'disable_user'):
+            response = client.post('/manage/', {'action': action, 'target': self.admin.pk}, follow=True)
+            self.assertContains(response, '管理員帳戶不能停用')
+        self.assertFalse(Identity.objects.filter(is_active=False).exists())
+        self.assertFalse(Candidate.objects.filter(is_active=False).exists())
+
+    def test_disabled_voter_can_log_in_with_password_and_qr_and_view_ballot(self):
+        ballot = submit_ballot(self.voter, [self.candidates[0].pk], 1)
+        manage_election('disable_user', str(self.voter.pk))
+        for qr in (False, True):
+            with self.subTest(qr=qr):
+                client = Client(enforce_csrf_checks=True)
+                if qr:
+                    client.get('/')
+                    client.post('/', {'password': self.admin_password, 'csrfmiddlewaretoken': client.cookies['csrftoken'].value})
+                url = '/?qr=1' if qr else '/'
+                client.get(url)
+                self.assertRedirects(client.post(url, {'password': self.password, 'csrfmiddlewaretoken': client.cookies['csrftoken'].value}), '/vote/')
+                response = client.get('/vote/')
+                self.assertContains(response, '你的投票權限已停用，仍可查看已提交的選票。')
+                self.assertEqual(response.context['ballot'], ballot)
+                self.assertEqual(response.context['selected'], {self.candidates[0].pk})
+                self.assertContains(response, '<fieldset disabled>')
+                self.assertNotContains(response, 'id="submit-vote"')
+                self.assertNotContains(response, 'name="blank"')
+                manage_election('close')
+                self.assertContains(client.get('/vote/'), '最後提交：')
+                manage_election('open')
+
+    def test_disabling_rejects_stale_and_direct_submissions_preserving_ballot(self):
+        ballot = submit_ballot(self.voter, [self.candidates[0].pk], 1)
+        old_time = ballot.submitted_at
+        session_key = self.client.session.session_key
+        self.assertContains(self.client.get('/vote/'), 'id="submit-vote"')
+        manage_election('disable_user', str(self.voter.pk))
+        for ids, blank in (([self.candidates[1].pk], False), ([], True)):
+            with self.assertRaisesMessage(ValidationError, '你的投票權限已停用'):
+                submit_ballot(self.voter, ids, 1, blank)
+            response = self.client.post('/vote/', {'candidate': ids, 'version': 1, 'blank': 'yes' if blank else ''})
+            self.assertContains(response, '你的投票權限已停用')
+            self.assertEqual(response.context['selected'], {self.candidates[0].pk})
+            self.assertNotContains(response, 'id="submit-vote"')
+        ballot.refresh_from_db()
+        self.assertEqual(ballot.submitted_at, old_time)
+        self.assertEqual(list(ballot.choices.all()), [self.candidates[0]])
+        self.assertEqual(self.client.session.session_key, session_key)
+        other, _ = create_identity('未投票用戶')
+        manage_election('disable_user', str(other.pk))
+        with self.assertRaises(ValidationError):
+            submit_ballot(other, [], 1, True)
+        self.assertFalse(Ballot.objects.filter(voter=other).exists())
+        client = Client()
+        client.post('/', {'password': self.admin_password})
+        manage_election('close')
+        response = client.get('/manage/')
+        self.assertEqual((response.context['total'], response.context['voted'], response.context['unvoted']), (2, 1, 1))
+        self.assertEqual(response.context['results'][0].votes, 1)
+        manage_election('enable_user', str(self.voter.pk))
+        self.assertEqual(password_for(self.voter), self.password)
+        self.assertEqual(list(ballot.choices.all()), [self.candidates[0]])
+        with self.assertRaises(ValidationError):
+            submit_ballot(self.voter, [self.candidates[1].pk], 1)
+        manage_election('open')
+        self.assertContains(self.client.get('/vote/'), 'id="submit-vote"')
+        self.assertRedirects(self.client.post('/vote/', {'candidate': self.candidates[1].pk, 'version': 1}), '/vote/')
+        self.assertEqual(list(ballot.choices.all()), [self.candidates[1]])
+
+    def test_disabled_voters_keep_numbers_credentials_and_counts(self):
+        from pypdf import PdfReader
+        other, _ = create_identity('第二位用戶')
+        manage_election('disable_user', str(self.voter.pk))
+        client = Client()
+        client.post('/', {'password': self.admin_password})
+        response = client.get('/manage/')
+        self.assertEqual(response.context['total'], 2)
+        self.assertEqual([(u.pk, u.display_number) for u in response.context['users']], [(self.voter.pk, 1), (other.pk, 2)])
+        self.assertContains(response, f'form="user-status-{self.voter.pk}" name="action" value="enable_user"')
+        for fields in ({'scope': 'all'}, {'scope': 'selected', 'users': [self.voter.pk]}):
+            response = client.post('/credentials/', fields)
+            text = PdfReader(BytesIO(response.content)).pages[0].extract_text()
+            self.assertIn('測試用戶（#1）', text)
+            self.assertIn(self.password, text)
+
+    def test_disabled_candidates_hidden_rejected_and_unranked(self):
+        disabled = self.candidates[0]
+        manage_election('disable_candidate', str(disabled.pk))
+        response = self.client.get('/vote/')
+        self.assertNotContains(response, f'name="candidate" value="{disabled.pk}"')
+        self.assertNotIn(disabled, response.context['candidates'])
+        self.assertContains(self.client.post('/vote/', {'candidate': disabled.pk, 'version': 1}), '有效候選人')
+        self.assertFalse(Ballot.objects.exists())
+        with self.assertRaises(ValidationError):
+            submit_ballot(self.voter, [disabled.pk], 1)
+        submit_ballot(self.voter, [c.pk for c in self.candidates[1:3]], 1)
+        manage_election('close')
+        client = Client()
+        client.post('/', {'password': self.admin_password})
+        response = client.get('/manage/')
+        results = response.context['results']
+        self.assertEqual([(c.votes, c.rank) for c in results[:3]], [(1, 1), (1, 1), (0, 3)])
+        self.assertEqual(results[-1], disabled)
+        self.assertFalse(hasattr(results[-1], 'rank'))
+        self.assertContains(response, f'aria-label="啟用候選人 {disabled.name}" disabled')
+
+    def test_candidate_status_locks_after_blank_and_clear_preserves_settings(self):
+        candidate = self.candidates[0]
+        manage_election('disable_candidate', str(candidate.pk))
+        manage_election('enable_candidate', str(candidate.pk))
+        manage_election('disable_candidate', str(candidate.pk))
+        ballot = submit_ballot(self.voter, [], 1, True)
+        manage_election('disable_user', str(self.voter.pk))
+        manage_election('close')
+        for action in ('enable_candidate', 'disable_candidate'):
+            with self.assertRaisesMessage(ValidationError, '啟用狀態已鎖定'):
+                manage_election(action, str(candidate.pk))
+        self.assertEqual(ballot.choices.count(), 0)
+        manage_election('clear', '清除全部選票')
+        self.voter.refresh_from_db()
+        candidate.refresh_from_db()
+        self.assertFalse(self.voter.is_active)
+        self.assertFalse(candidate.is_active)
+        self.assertEqual(password_for(self.voter), self.password)
+        manage_election('enable_candidate', str(candidate.pk))
+        candidate.refresh_from_db()
+        self.assertTrue(candidate.is_active)
+
+    def test_open_requires_active_candidate_and_new_records_default_active(self):
+        self.assertTrue(self.voter.is_active)
+        self.assertTrue(self.admin.is_active)
+        self.assertTrue(all(c.is_active for c in self.candidates))
+        manage_election('close')
+        for candidate in self.candidates:
+            manage_election('disable_candidate', str(candidate.pk))
+        with self.assertRaisesMessage(ValidationError, '至少需要一位已啟用候選人'):
+            manage_election('open')
+        self.assertFalse(Election.objects.get(pk=1).is_open)
+        manage_election('enable_candidate', str(self.candidates[0].pk))
+        manage_election('open')
+        self.assertTrue(Election.objects.get(pk=1).is_open)
 
     def test_batch_create_users_and_candidates(self):
         client = Client()
@@ -496,6 +665,63 @@ class ConcurrencyTests(TransactionTestCase):
         self.assertEqual(Candidate.objects.count(), 3 if results[0] == 'ok' else 2)
         with self.assertRaises(ValidationError):
             manage_election('candidate', '投票後不得新增')
+
+    def test_candidate_status_races_first_blank_ballot(self):
+        candidate = self.candidates[0]
+        results = self.race(lambda: manage_election('disable_candidate', str(candidate.pk)), lambda: submit_ballot(self.voter, [], 1, True))
+        self.assertEqual(results[1], 'ok')
+        candidate.refresh_from_db()
+        self.assertEqual(candidate.is_active, results[0] != 'ok')
+        with self.assertRaises(ValidationError):
+            manage_election('enable_candidate', str(candidate.pk))
+
+    def test_voter_disabling_and_submission_follow_transaction_order(self):
+        disable = lambda: manage_election('disable_user', str(self.voter.pk))
+        submit = lambda: submit_ballot(self.voter, [self.candidates[1].pk], 1)
+        for disable_first in (True, False):
+            with self.subTest(disable_first=disable_first):
+                manage_election('enable_user', str(self.voter.pk))
+                ballot = submit_ballot(self.voter, [self.candidates[0].pk], 1)
+                held, attempted, release = threading.Event(), threading.Event(), threading.Event()
+                first, second = (disable, submit) if disable_first else (submit, disable)
+                def hold_first():
+                    connections.close_all()
+                    try:
+                        with transaction.atomic():
+                            first()
+                            held.set()
+                            if not release.wait(10):
+                                raise AssertionError('Timed out waiting to release transaction')
+                    finally:
+                        connections.close_all()
+                def run_second():
+                    connection = connections['default']
+                    def observe_begin(execute, sql, params, many, context):
+                        if sql == 'BEGIN IMMEDIATE':
+                            attempted.set()
+                        return execute(sql, params, many, context)
+                    try:
+                        with connection.execute_wrapper(observe_begin):
+                            try:
+                                second()
+                                return 'ok'
+                            except ValidationError:
+                                return 'rejected'
+                    finally:
+                        connection.close()
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    first_future = pool.submit(hold_first)
+                    try:
+                        self.assertTrue(held.wait(10))
+                        second_future = pool.submit(run_second)
+                        self.assertTrue(attempted.wait(10))
+                    finally:
+                        release.set()
+                    first_future.result(timeout=10)
+                    self.assertEqual(second_future.result(timeout=10), 'rejected' if disable_first else 'ok')
+                self.voter.refresh_from_db()
+                self.assertFalse(self.voter.is_active)
+                self.assertEqual(list(ballot.choices.all()), [self.candidates[0 if disable_first else 1]])
 
     def test_real_sqlite_lock_timeout_preserves_ballot(self):
         submit_ballot(self.voter, [self.candidates[0].pk], 1)

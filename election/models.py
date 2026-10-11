@@ -4,6 +4,7 @@ from django.db import models
 class Identity(models.Model):
     name = models.CharField(max_length=80)
     is_admin = models.BooleanField(default=False)
+    is_active = models.BooleanField(default=True)
     password_index = models.CharField(max_length=64, unique=True)
     encrypted_password = models.TextField(blank=True)
 
@@ -13,6 +14,7 @@ class Identity(models.Model):
 
 class Candidate(models.Model):
     name = models.CharField(max_length=80)
+    is_active = models.BooleanField(default=True)
 
     class Meta:
         ordering = ['id']
