@@ -5,7 +5,7 @@ from django.conf import settings
 from django.contrib import messages
 from django.core.exceptions import ValidationError
 from django.db import transaction
-from django.db.models import Count
+from django.db.models import Count, Q
 from django.http import HttpResponse
 from django.middleware.csrf import rotate_token
 from django.shortcuts import redirect, render
@@ -15,7 +15,7 @@ from reportlab.pdfbase.ttfonts import TTFError
 
 from .models import Ballot, Candidate, Election, Identity
 from .pdf import credential_pdf
-from .services import authenticate, manage_election, password_for, submit_ballot, voter_numbers
+from .services import authenticate, manage_election, submit_ballot, voter_numbers
 
 
 def access(admin=False):
@@ -72,20 +72,20 @@ def vote(request):
     error = ''
     if request.method == 'POST':
         try:
-            submit_ballot(request.identity, request.POST.getlist('candidate'), request.POST.get('version'), request.POST.get('blank') == 'yes')
+            submit_ballot(request.identity, request.POST.getlist('candidate'), request.POST.get('election_id'), request.POST.get('version'), request.POST.get('blank') == 'yes')
         except ValidationError as exc:
             error = ' '.join(exc.messages)
         else:
             messages.success(request, '選票已儲存。開放期間可再次提交，以最後成功提交的選票為準。')
             return redirect('vote')
     with transaction.atomic():
-        election = Election.objects.get(pk=1)
+        election = Election.objects.order_by('-pk').first()
         request.identity.refresh_from_db(fields=['is_active'])
-        ballot = Ballot.objects.filter(voter=request.identity).first()
+        ballot = Ballot.objects.filter(election=election, voter=request.identity).first()
         selected = set(ballot.choices.values_list('pk', flat=True)) if ballot else set()
-        candidates = list(Candidate.objects.filter(is_active=True))
+        candidates = list(election.candidates.all()) if election else []
         request.identity.display_number = voter_numbers()[request.identity.pk]
-    if error and str(election.version) == request.POST.get('version') and election.is_open and request.identity.is_active:
+    if error and election and str(election.pk) == request.POST.get('election_id') and str(election.version) == request.POST.get('version') and election.is_open and request.identity.is_active:
         selected = {int(value) for value in request.POST.getlist('candidate') if value.isdecimal() and len(value) < 12}
     return render(request, 'election/vote.html', {'identity': request.identity, 'election': election, 'ballot': ballot, 'selected': selected, 'candidates': candidates, 'error': error})
 
@@ -96,39 +96,35 @@ def dashboard(request):
     if request.method == 'POST':
         try:
             action = request.POST.get('action')
-            if action in ('enable_user', 'disable_user', 'enable_candidate', 'disable_candidate'):
-                field = 'target'
-            else:
-                field = 'confirmation' if action in ('clear', 'reset') else 'name'
-            manage_election(action, request.POST.get(field, ''))
+            field = 'target' if action in ('enable_user', 'disable_user') else 'confirmation'
+            manage_election(action, request.POST.get(field, ''), election_id=request.POST.get('election_id'), version=request.POST.get('version'), title=request.POST.get('title', ''), selected=request.POST.getlist('candidate'), maximum=request.POST.get('maximum'))
         except ValidationError as exc:
             messages.error(request, ' '.join(exc.messages))
         else:
             messages.success(request, '操作已完成。')
         return redirect('dashboard')
     with transaction.atomic():
-        election = Election.objects.get(pk=1)
-        users = list(Identity.objects.filter(is_admin=False).annotate(ballot_count=Count('ballot')))
-        candidates = Candidate.objects.all()
-        if not election.is_open:
-            candidates = candidates.annotate(votes=Count('choice')).order_by('-is_active', '-votes', 'id')
-        results = list(candidates)
-        voted = Ballot.objects.count()
-        blank = None if election.is_open else Ballot.objects.annotate(total=Count('choices')).filter(total=0).count()
-    if not election.is_open:
+        latest = Election.objects.order_by('-pk').first()
+        rounds = list(Election.objects.order_by('-pk'))
+        election = latest
+        requested = request.GET.get('round', '')
+        if requested.isdecimal() and len(requested) < 12:
+            election = Election.objects.filter(pk=requested).first() or latest
+        users = list(Identity.objects.filter(is_admin=False).annotate(ballot_count=Count('ballot', filter=Q(ballot__election=election))))
+        results = election.candidates.all() if election else Candidate.objects.none()
+        if election and not election.is_open:
+            results = results.annotate(votes=Count('choice', filter=Q(choice__ballot__election=election))).order_by('-votes', 'id')
+        results = list(results)
+        ballots = Ballot.objects.filter(election=election)
+        voted = ballots.count()
+    if election and not election.is_open:
         last_votes, rank = None, 0
         for position, candidate in enumerate(results, 1):
-            if not candidate.is_active:
-                continue
             if candidate.votes != last_votes:
                 rank = position
             candidate.rank = rank
             last_votes = candidate.votes
-    for number, user in enumerate(users, 1):
-        user.display_number = number
-        if str(user.pk) == request.GET.get('reveal'):
-            user.password_display = password_for(user)
-    return render(request, 'election/dashboard.html', {'identity': request.identity, 'election': election, 'users': users, 'results': results, 'voted': voted, 'blank': blank, 'total': len(users), 'unvoted': len(users) - voted})
+    return render(request, 'election/dashboard.html', {'identity': request.identity, 'latest': latest, 'rounds': rounds, 'titles': settings.ELECTION_TITLES, 'roster': Candidate.objects.all(), 'election': election, 'users': users, 'results': results, 'voted': voted, 'total': len(users), 'unvoted': len(users) - voted})
 
 
 @access(admin=True)

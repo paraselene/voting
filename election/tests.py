@@ -1,440 +1,297 @@
-import threading
 import sqlite3
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from io import BytesIO, StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-from django.core.exceptions import ValidationError
+from django.conf import settings
 from django.contrib.sessions.models import Session
+from django.core.exceptions import ValidationError
 from django.core.management import call_command
-from django.db import OperationalError, connections, transaction
+from django.core.management.base import CommandError
+from django.db import IntegrityError, OperationalError, connections, transaction
 from django.test import Client, TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 
 from .models import Ballot, Candidate, Choice, Election, Identity, LoginAttempt
-from .services import ALPHABET, authenticate, create_identity, digest, manage_election, password_for, submit_ballot
+from .services import ALPHABET, authenticate, create_identity, digest, fresh_setup, manage_election, password_for, submit_ballot
 from .views import client_ip
 
 
-class VotingTests(TestCase):
-    def setUp(self):
-        Election.objects.get_or_create(pk=1)
-        self.voter, self.password = create_identity('測試用戶')
+class RoundMixin:
+    def setup_round(self):
+        fresh_setup()
+        self.voter = Identity.objects.get(number=1)
+        self.password = password_for(self.voter)
         self.admin, self.admin_password = create_identity('管理員', True)
-        self.candidates = [Candidate.objects.create(name=f'候選人{i}') for i in range(11)]
-        manage_election('open')
-        session = self.client.session
-        session['identity'] = self.voter.pk
-        session.save()
+        self.candidates = list(Candidate.objects.all())
+        self.election = self.manage('create', title=settings.ELECTION_TITLES[0], selected=[c.pk for c in self.candidates], maximum=10)
 
-    def test_password_format_encryption_roles_and_uniqueness(self):
-        seen = {self.password, self.admin_password}
-        for _ in range(30):
-            user, password = create_identity('同名用戶')
+    def manage(self, action, value='', **kwargs):
+        latest = Election.objects.order_by('-pk').first()
+        return manage_election(action, value, election_id=latest.pk if latest else 0, version=latest.version if latest else 0, **kwargs)
+
+    def submit(self, selected=(), blank=False, voter=None):
+        latest = Election.objects.order_by('-pk').first()
+        return submit_ballot(voter or self.voter, selected, latest.pk, latest.version, blank)
+
+    def fields(self):
+        latest = Election.objects.order_by('-pk').first()
+        return {'election_id': latest.pk, 'version': latest.version}
+
+
+class VotingTests(RoundMixin, TestCase):
+    def setUp(self):
+        self.setup_round()
+        self.client.post('/', {'password': self.password})
+
+    def test_fixed_roster_numbers_credentials_and_no_voter_names(self):
+        self.assertEqual(list(Candidate.objects.values_list('name', flat=True)), settings.CANDIDATE_NAMES)
+        self.assertEqual(list(Identity.objects.filter(is_admin=False).values_list('number', flat=True)), list(range(1, 20)))
+        self.assertFalse(Identity.objects.filter(is_admin=False).exclude(name='').exists())
+        self.assertEqual(self.admin.encrypted_password, '')
+        for user in Identity.objects.filter(is_admin=False):
+            password = password_for(user)
             self.assertEqual(len(password), 5)
             self.assertTrue(set(password) <= set(ALPHABET))
-            self.assertNotIn(password, seen)
-            seen.add(password)
-            self.assertEqual(password_for(user), password)
             self.assertNotIn(password, user.encrypted_password)
-        self.assertEqual(self.admin.encrypted_password, '')
-        user, error = authenticate(self.password.lower(), '127.0.0.1')
-        self.assertEqual(user, self.voter)
-        self.assertFalse(error)
+            self.assertEqual(authenticate(password.lower(), '127.0.0.1')[0], user)
+        self.assertContains(self.client.get('/vote/'), '投票者編號 1')
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            Identity.objects.create(name='不能儲存姓名', number=19, password_index='invalid')
+
+    def test_blank_limit_revote_and_invalid_ballot_preserves_previous(self):
+        with self.assertRaises(ValidationError):
+            self.submit()
+        ballot = self.submit(blank=True)
+        self.assertEqual(ballot.choices.count(), 0)
+        ids = [c.pk for c in self.candidates[:10]]
+        self.submit(ids)
+        for invalid in ([c.pk for c in self.candidates[:11]], ['bad'], [999999], [ids[0], ids[0]]):
+            with self.assertRaises(ValidationError):
+                self.submit(invalid)
+            self.assertEqual(set(ballot.choices.values_list('pk', flat=True)), set(ids))
+        self.submit([ids[0]])
+        self.assertEqual(Ballot.objects.count(), 1)
+        self.assertEqual(ballot.choices.count(), 1)
+
+    def test_rounds_repeated_titles_candidate_scope_and_credential_stability(self):
+        first = self.election
+        self.submit([self.candidates[0].pk])
+        self.manage('close')
+        second = self.manage('create', title=first.title, selected=[self.candidates[1].pk], maximum=1)
+        self.assertNotEqual(first.pk, second.pk)
+        self.assertEqual(password_for(self.voter), self.password)
+        with self.assertRaises(ValidationError):
+            self.submit([self.candidates[0].pk])
+        self.submit([self.candidates[1].pk])
+        self.assertEqual(Ballot.objects.filter(voter=self.voter).count(), 2)
+        self.assertEqual(list(self.client.get('/vote/', {'round': first.pk}).context['candidates']), [self.candidates[1]])
+        self.assertNotContains(self.client.get('/vote/'), self.candidates[0].name)
+        with self.assertRaises(ValidationError):
+            manage_election('open', election_id=first.pk, version=first.version)
+        self.assertTrue(Election.objects.get(pk=second.pk).is_open)
+
+    def test_lifecycle_versions_and_frozen_settings(self):
+        self.submit(blank=True)
+        old = self.fields()
+        with self.assertRaises(ValidationError):
+            self.manage('create', title=self.election.title, selected=[self.candidates[0].pk], maximum=1)
+        self.manage('close')
+        with self.assertRaises(ValidationError):
+            manage_election('open', **old)
+        with self.assertRaises(ValidationError):
+            self.submit(blank=True)
+        self.manage('open')
+        with self.assertRaises(ValidationError):
+            submit_ballot(self.voter, [], **old, blank_confirmed=True)
+        self.assertEqual(Ballot.objects.count(), 1)
+        self.election.title = '更改'
+        with self.assertRaises(ValidationError):
+            self.election.save()
+        with self.assertRaises(ValidationError), transaction.atomic():
+            self.election.candidates.clear()
+        with self.assertRaises(ValidationError), transaction.atomic():
+            self.election.candidates.remove(self.candidates[0])
+        self.manage('close')
+        self.manage('create', title=settings.ELECTION_TITLES[1], selected=[self.candidates[0].pk], maximum=1)
+        with self.assertRaises(ValidationError):
+            self.manage('candidate', '新增')
+        with self.assertRaises(ValidationError):
+            self.manage('disable_candidate', str(self.candidates[0].pk))
+
+    def test_environment_configuration_applies_to_setup_and_future_rounds(self):
+        saved_candidates = list(self.election.candidates.values_list('name', flat=True))
+        with override_settings(ELECTION_TITLES=['自訂職位'], CANDIDATE_NAMES=[f'名單{i}' for i in range(19)]):
+            self.manage('close')
+            self.assertEqual(list(self.election.candidates.values_list('name', flat=True)), saved_candidates)
+            new = self.manage('create', title='自訂職位', selected=[self.candidates[0].pk], maximum=1)
+            self.assertEqual(new.title, '自訂職位')
+            self.assertEqual(Candidate.objects.first().name, saved_candidates[0])
+            self.manage('reset', '清除全部資料')
+            self.assertEqual(list(Candidate.objects.values_list('name', flat=True)), [f'名單{i}' for i in range(19)])
+
+    def test_creation_validation_and_admin_form(self):
+        self.manage('close')
+        for ids, maximum, title in [([],1,self.election.title),([999],1,self.election.title),([self.candidates[0].pk]*2,1,self.election.title),([self.candidates[0].pk],2,self.election.title),([self.candidates[0].pk],0,self.election.title),([self.candidates[0].pk],1,'unknown')]:
+            with self.assertRaises(ValidationError):
+                self.manage('create', title=title, selected=ids, maximum=maximum)
+        client = Client(); client.post('/', {'password': self.admin_password})
+        page = client.get('/manage/')
+        self.assertContains(page, '全選')
+        self.assertContains(page, '取消全選')
+        self.assertEqual(page.content.decode().count('name="candidate"'), 19)
+        self.assertEqual(page.content.decode().count(' checked'), 19)
+        self.assertNotContains(page, '新增候選人')
+        self.assertNotContains(page, '用戶姓名')
+        fields = self.fields() | {'action':'create', 'title':settings.ELECTION_TITLES[1], 'maximum':1, 'candidate':[self.candidates[0].pk]}
+        self.assertRedirects(client.post('/manage/', fields), '/manage/')
+        self.assertEqual(Election.objects.count(), 2)
+
+    def test_results_privacy_ties_and_historical_participation(self):
+        self.submit([c.pk for c in self.candidates[:2]])
+        self.submit(blank=True, voter=Identity.objects.get(number=2))
+        admin = Client(); admin.post('/', {'password': self.admin_password})
+        page = admin.get('/manage/')
+        self.assertNotContains(page, '<th>票數</th>')
+        self.assertNotContains(page, '空白票')
+        self.assertFalse(any(hasattr(c,'votes') for c in page.context['results']))
+        self.manage('close')
+        page = admin.get('/manage/')
+        self.assertEqual(page.context['voted'], 2)
+        self.assertNotContains(page, '空白票')
+        self.assertEqual([(c.votes,c.rank) for c in page.context['results'][:3]], [(1,1),(1,1),(0,3)])
+        self.manage('create', title=self.election.title, selected=[c.pk for c in self.candidates], maximum=1)
+        self.submit([self.candidates[2].pk])
+        page = admin.get('/manage/', {'round':self.election.pk})
+        self.assertNotContains(page, '空白票')
+        self.assertEqual(page.context['voted'], 2)
+        self.assertEqual([(c.votes,c.rank) for c in page.context['results'][:3]], [(1,1),(1,1),(0,3)])
+        self.assertEqual(sum(u.ballot_count for u in page.context['users']), 2)
+        self.assertNotContains(self.client.get('/vote/'), '票數')
+
+    def test_clear_only_latest_and_reset_preserves_admin_invalidates_sessions(self):
+        self.submit(blank=True)
+        self.manage('close')
+        self.manage('create', title=self.election.title, selected=[c.pk for c in self.candidates], maximum=1)
+        self.submit(blank=True)
+        old = self.fields()
+        with self.assertRaises(ValidationError): self.manage('clear', 'wrong')
+        self.manage('clear', '清除本輪選票')
+        self.assertEqual(Ballot.objects.count(), 1)
+        self.assertFalse(Election.objects.latest('pk').is_open)
+        with self.assertRaises(ValidationError): manage_election('open', **old)
+        admin = Client(); admin.post('/', {'password': self.admin_password})
+        old_passwords = set(Identity.objects.filter(is_admin=False).values_list('password_index', flat=True))
+        self.manage('reset', '清除全部資料')
+        self.assertFalse(Election.objects.exists())
+        self.assertEqual(Candidate.objects.count(),19)
+        self.assertEqual(Identity.objects.filter(is_admin=False).count(),19)
+        self.assertFalse(old_passwords & set(Identity.objects.filter(is_admin=False).values_list('password_index', flat=True)))
+        self.assertRedirects(self.client.get('/vote/'), '/')
+        self.assertEqual(admin.get('/manage/').status_code,200)
+        self.assertContains(admin.get('/manage/'), '建立並開放')
+
+    def test_full_reset_restarts_round_numbers_and_rejects_old_forms(self):
+        old = self.fields()
+        self.manage('close')
+        second = self.manage('create', title=self.election.title, selected=[self.candidates[0].pk], maximum=1)
+        self.assertEqual(second.number, 2)
+        self.manage('clear', '清除本輪選票')
+        self.assertEqual(second.number, 2)
+        self.manage('reset', '清除全部資料')
+        candidate = Candidate.objects.first()
+        first = self.manage('create', title=self.election.title, selected=[candidate.pk], maximum=1)
+        self.assertEqual(first.number, 1)
+        self.assertNotEqual(first.pk, old['election_id'])
+        with self.assertRaises(ValidationError):
+            manage_election('close', **old)
+        voter = Client()
+        voter.post('/', {'password': password_for(Identity.objects.get(number=1))})
+        self.assertContains(voter.get('/vote/'), '第 1 輪')
+        admin = Client()
+        admin.post('/', {'password': self.admin_password})
+        self.assertContains(admin.get('/manage/'), '第 1 輪')
+        self.manage('close')
+        second = self.manage('create', title=self.election.title, selected=[candidate.pk], maximum=1)
+        self.assertEqual(second.number, 2)
+
+    def test_disabled_voter_qr_read_only_and_admin_permissions(self):
+        ballot = self.submit([self.candidates[0].pk])
+        self.manage('disable_user', str(self.voter.pk))
+        self.assertEqual(authenticate(self.password,'127.0.0.1')[0],self.voter)
+        self.client.get('/?qr=1')
+        self.client.post('/?qr=1',{'password':self.password})
+        page = self.client.get('/vote/')
+        self.assertEqual(page.context['ballot'],ballot)
+        self.assertContains(page,'<fieldset disabled>')
+        self.assertNotContains(page,'id="submit-vote"')
+        with self.assertRaises(ValidationError): self.submit(blank=True)
+        self.assertEqual(ballot.choices.count(),1)
+        with self.assertRaises(ValidationError): self.manage('disable_user',str(self.admin.pk))
+        self.assertEqual(self.client.post('/manage/',self.fields()|{'action':'close'}).status_code,403)
+        self.assertEqual(self.client.post('/credentials/',{'scope':'all'}).status_code,403)
+        self.manage('enable_user', str(self.voter.pk))
+        self.submit(blank=True)
+
+    def test_csrf_on_lifecycle_and_credentials(self):
+        client=Client(enforce_csrf_checks=True); client.get('/')
+        client.post('/',{'password':self.admin_password,'csrfmiddlewaretoken':client.cookies['csrftoken'].value})
+        for url, fields in [('/manage/',self.fields()|{'action':'close'}),('/credentials/',{'scope':'all'})]:
+            self.assertEqual(client.post(url,fields).status_code,403)
+        self.assertEqual(client.post('/manage/',self.fields()|{'action':'close','csrfmiddlewaretoken':client.cookies['csrftoken'].value}).status_code,302)
+        self.assertFalse(Election.objects.get().is_open)
+
+    def test_invalid_stale_post_and_rollback(self):
+        fields=self.fields()|{'candidate':[self.candidates[0].pk]}
+        self.assertRedirects(self.client.post('/vote/',fields),'/vote/')
+        with patch('election.services.Choice.objects.bulk_create',side_effect=OperationalError('database is locked')):
+            self.assertEqual(self.client.post('/vote/',self.fields()|{'blank':'yes'}).status_code,503)
+        self.assertEqual(list(Ballot.objects.get().choices.all()),[self.candidates[0]])
+        self.assertContains(self.client.post('/vote/',self.fields()|{'candidate':'bad'}),'候選人資料無效')
+        self.assertContains(self.client.post('/vote/',{'blank':'yes'}),'輪次資料已過期')
+
+    def test_admin_cannot_reveal_passwords_even_with_old_query_parameter(self):
+        admin = Client()
+        admin.post('/', {'password': self.admin_password})
+        for query in ({}, {'reveal': self.voter.pk}):
+            page = admin.get('/manage/', query)
+            self.assertNotContains(page, self.password)
+            self.assertNotContains(page, '顯示密碼')
+            self.assertNotContains(page, '隱藏密碼')
+            self.assertNotContains(page, 'reveal-password-form')
+            self.assertNotContains(page, '<th>密碼</th>')
+            self.assertFalse(any(hasattr(user, 'password_display') for user in page.context['users']))
+
+    def test_credentials_number_only_pdf_pagination_selected_and_qr(self):
+        from pypdf import PdfReader
+        from reportlab.graphics.barcode.qr import QrCodeWidget
+        from .pdf import credential_pdf
+        admin=Client();admin.post('/',{'password':self.admin_password})
+        response=admin.post('/credentials/',{'scope':'all'})
+        self.assertIn('no-store',response['Cache-Control'])
+        pages=PdfReader(BytesIO(response.content)).pages
+        self.assertEqual([p.extract_text().count('登入憑證') for p in pages],[8,8,3])
+        self.assertNotIn('姓名', ''.join(p.extract_text() for p in pages))
+        self.assertNotIn('最多選 10', ''.join(p.extract_text() for p in pages))
+        response=admin.post('/credentials/',{'users':[Identity.objects.get(number=19).pk,self.admin.pk]})
+        text=PdfReader(BytesIO(response.content)).pages[0].extract_text()
+        self.assertIn('投票者編號：19',text)
+        self.assertNotIn(self.admin_password,text)
+        with patch('election.pdf.QrCodeWidget',wraps=QrCodeWidget) as qr:
+            credential_pdf([self.voter])
+            self.assertEqual(qr.call_args.args[0],f'{settings.PUBLIC_URL}/#password={self.password}')
+        self.assertEqual(admin.post('/credentials/',{'users':['bad']}).status_code,400)
 
     def test_collision_retries(self):
         with patch('election.services.secrets.choice', side_effect=list(self.password + '22222')):
             if self.password == '22222':
                 self.skipTest('隨機憑證剛好等於碰撞測試值')
-            _, password = create_identity('碰撞測試')
+            Identity.objects.get(number=2).delete()
+            _, password = create_identity(number=2)
         self.assertEqual(password, '22222')
-
-    def test_blank_ten_replace_and_validation_preserves_old_ballot(self):
-        with self.assertRaises(ValidationError):
-            submit_ballot(self.voter, [], 1)
-        ballot = submit_ballot(self.voter, [], 1, True)
-        self.assertEqual(Ballot.objects.count(), 1)
-        self.assertEqual(ballot.choices.count(), 0)
-        ids = [c.pk for c in self.candidates[:10]]
-        submit_ballot(self.voter, ids, 1)
-        for invalid in ([c.pk for c in self.candidates], [99999], ['bad'], [ids[0], ids[0]]):
-            with self.assertRaises(ValidationError):
-                submit_ballot(self.voter, invalid, 1)
-            self.assertEqual(set(ballot.choices.values_list('pk', flat=True)), set(ids))
-        submit_ballot(self.voter, [self.candidates[-1].pk], 1)
-        self.assertEqual(Ballot.objects.count(), 1)
-        self.assertEqual(list(ballot.choices.all()), [self.candidates[-1]])
-
-    def test_close_reopen_clear_stale_and_candidate_lock(self):
-        submit_ballot(self.voter, [], 1, True)
-        with self.assertRaises(ValidationError):
-            manage_election('candidate', '不能新增')
-        manage_election('close')
-        with self.assertRaises(ValidationError):
-            submit_ballot(self.voter, [], 1, True)
-        self.assertContains(self.client.get('/vote/'), '空白票')
-        manage_election('open')
-        submit_ballot(self.voter, [self.candidates[0].pk], 1)
-        with self.assertRaises(ValidationError):
-            manage_election('clear', 'wrong')
-        manage_election('clear', '清除全部選票')
-        self.assertFalse(Ballot.objects.exists())
-        self.assertEqual(Identity.objects.count(), 2)
-        self.assertEqual(password_for(self.voter), self.password)
-        manage_election('candidate', '新候選人')
-        manage_election('open')
-        with self.assertRaises(ValidationError):
-            submit_ballot(self.voter, [self.candidates[0].pk], 1)
-
-    def test_no_candidates_cannot_open(self):
-        Candidate.objects.all().delete()
-        manage_election('close')
-        with self.assertRaises(ValidationError):
-            manage_election('open')
-
-    def test_status_actions_require_admin_post_and_csrf(self):
-        client = Client(enforce_csrf_checks=True)
-        client.get('/')
-        client.post('/', {'password': self.admin_password, 'csrfmiddlewaretoken': client.cookies['csrftoken'].value})
-        for action, target in (('disable_user', self.voter), ('disable_candidate', self.candidates[0])):
-            fields = {'action': action, 'target': target.pk}
-            self.assertRedirects(Client().post('/manage/', fields), '/')
-            self.assertEqual(self.client.post('/manage/', fields).status_code, 403)
-            self.assertEqual(client.post('/manage/', fields).status_code, 403)
-            client.get('/manage/', fields)
-            target.refresh_from_db()
-            self.assertTrue(target.is_active)
-            fields['csrfmiddlewaretoken'] = client.cookies['csrftoken'].value
-            self.assertRedirects(client.post('/manage/', fields), '/manage/')
-            target.refresh_from_db()
-            self.assertFalse(target.is_active)
-            fields['action'] = action.replace('disable_', 'enable_')
-            self.assertRedirects(client.post('/manage/', fields), '/manage/')
-            target.refresh_from_db()
-            self.assertTrue(target.is_active)
-
-    def test_invalid_status_targets_and_admin_protection(self):
-        client = Client()
-        client.post('/', {'password': self.admin_password})
-        for action in ('enable_user', 'disable_user', 'enable_candidate', 'disable_candidate'):
-            for target in ('', 'bad', '-1', '0', '999999', '9' * 13):
-                with self.subTest(action=action, target=target):
-                    response = client.post('/manage/', {'action': action, 'target': target}, follow=True)
-                    self.assertContains(response, '啟用／停用對象無效')
-        for action in ('enable_user', 'disable_user'):
-            response = client.post('/manage/', {'action': action, 'target': self.admin.pk}, follow=True)
-            self.assertContains(response, '管理員帳戶不能停用')
-        self.assertFalse(Identity.objects.filter(is_active=False).exists())
-        self.assertFalse(Candidate.objects.filter(is_active=False).exists())
-
-    def test_disabled_voter_can_log_in_with_password_and_qr_and_view_ballot(self):
-        ballot = submit_ballot(self.voter, [self.candidates[0].pk], 1)
-        manage_election('disable_user', str(self.voter.pk))
-        for qr in (False, True):
-            with self.subTest(qr=qr):
-                client = Client(enforce_csrf_checks=True)
-                if qr:
-                    client.get('/')
-                    client.post('/', {'password': self.admin_password, 'csrfmiddlewaretoken': client.cookies['csrftoken'].value})
-                url = '/?qr=1' if qr else '/'
-                client.get(url)
-                self.assertRedirects(client.post(url, {'password': self.password, 'csrfmiddlewaretoken': client.cookies['csrftoken'].value}), '/vote/')
-                response = client.get('/vote/')
-                self.assertContains(response, '你的投票權限已停用，仍可查看已提交的選票。')
-                self.assertEqual(response.context['ballot'], ballot)
-                self.assertEqual(response.context['selected'], {self.candidates[0].pk})
-                self.assertContains(response, '<fieldset disabled>')
-                self.assertNotContains(response, 'id="submit-vote"')
-                self.assertNotContains(response, 'name="blank"')
-                manage_election('close')
-                self.assertContains(client.get('/vote/'), '最後提交：')
-                manage_election('open')
-
-    def test_disabling_rejects_stale_and_direct_submissions_preserving_ballot(self):
-        ballot = submit_ballot(self.voter, [self.candidates[0].pk], 1)
-        old_time = ballot.submitted_at
-        session_key = self.client.session.session_key
-        self.assertContains(self.client.get('/vote/'), 'id="submit-vote"')
-        manage_election('disable_user', str(self.voter.pk))
-        for ids, blank in (([self.candidates[1].pk], False), ([], True)):
-            with self.assertRaisesMessage(ValidationError, '你的投票權限已停用'):
-                submit_ballot(self.voter, ids, 1, blank)
-            response = self.client.post('/vote/', {'candidate': ids, 'version': 1, 'blank': 'yes' if blank else ''})
-            self.assertContains(response, '你的投票權限已停用')
-            self.assertEqual(response.context['selected'], {self.candidates[0].pk})
-            self.assertNotContains(response, 'id="submit-vote"')
-        ballot.refresh_from_db()
-        self.assertEqual(ballot.submitted_at, old_time)
-        self.assertEqual(list(ballot.choices.all()), [self.candidates[0]])
-        self.assertEqual(self.client.session.session_key, session_key)
-        other, _ = create_identity('未投票用戶')
-        manage_election('disable_user', str(other.pk))
-        with self.assertRaises(ValidationError):
-            submit_ballot(other, [], 1, True)
-        self.assertFalse(Ballot.objects.filter(voter=other).exists())
-        client = Client()
-        client.post('/', {'password': self.admin_password})
-        manage_election('close')
-        response = client.get('/manage/')
-        self.assertEqual((response.context['total'], response.context['voted'], response.context['unvoted']), (2, 1, 1))
-        self.assertEqual(response.context['results'][0].votes, 1)
-        manage_election('enable_user', str(self.voter.pk))
-        self.assertEqual(password_for(self.voter), self.password)
-        self.assertEqual(list(ballot.choices.all()), [self.candidates[0]])
-        with self.assertRaises(ValidationError):
-            submit_ballot(self.voter, [self.candidates[1].pk], 1)
-        manage_election('open')
-        self.assertContains(self.client.get('/vote/'), 'id="submit-vote"')
-        self.assertRedirects(self.client.post('/vote/', {'candidate': self.candidates[1].pk, 'version': 1}), '/vote/')
-        self.assertEqual(list(ballot.choices.all()), [self.candidates[1]])
-
-    def test_disabled_voters_keep_numbers_credentials_and_counts(self):
-        from pypdf import PdfReader
-        other, _ = create_identity('第二位用戶')
-        manage_election('disable_user', str(self.voter.pk))
-        client = Client()
-        client.post('/', {'password': self.admin_password})
-        response = client.get('/manage/')
-        self.assertEqual(response.context['total'], 2)
-        self.assertEqual([(u.pk, u.display_number) for u in response.context['users']], [(self.voter.pk, 1), (other.pk, 2)])
-        self.assertContains(response, f'form="user-status-{self.voter.pk}" name="action" value="enable_user"')
-        for fields in ({'scope': 'all'}, {'scope': 'selected', 'users': [self.voter.pk]}):
-            response = client.post('/credentials/', fields)
-            text = PdfReader(BytesIO(response.content)).pages[0].extract_text()
-            self.assertIn('測試用戶（#1）', text)
-            self.assertIn(self.password, text)
-
-    def test_disabled_candidates_hidden_rejected_and_unranked(self):
-        disabled = self.candidates[0]
-        manage_election('disable_candidate', str(disabled.pk))
-        response = self.client.get('/vote/')
-        self.assertNotContains(response, f'name="candidate" value="{disabled.pk}"')
-        self.assertNotIn(disabled, response.context['candidates'])
-        self.assertContains(self.client.post('/vote/', {'candidate': disabled.pk, 'version': 1}), '有效候選人')
-        self.assertFalse(Ballot.objects.exists())
-        with self.assertRaises(ValidationError):
-            submit_ballot(self.voter, [disabled.pk], 1)
-        submit_ballot(self.voter, [c.pk for c in self.candidates[1:3]], 1)
-        manage_election('close')
-        client = Client()
-        client.post('/', {'password': self.admin_password})
-        response = client.get('/manage/')
-        results = response.context['results']
-        self.assertEqual([(c.votes, c.rank) for c in results[:3]], [(1, 1), (1, 1), (0, 3)])
-        self.assertEqual(results[-1], disabled)
-        self.assertFalse(hasattr(results[-1], 'rank'))
-        self.assertContains(response, f'aria-label="啟用候選人 {disabled.name}" disabled')
-
-    def test_candidate_status_locks_after_blank_and_clear_preserves_settings(self):
-        candidate = self.candidates[0]
-        manage_election('disable_candidate', str(candidate.pk))
-        manage_election('enable_candidate', str(candidate.pk))
-        manage_election('disable_candidate', str(candidate.pk))
-        ballot = submit_ballot(self.voter, [], 1, True)
-        manage_election('disable_user', str(self.voter.pk))
-        manage_election('close')
-        for action in ('enable_candidate', 'disable_candidate'):
-            with self.assertRaisesMessage(ValidationError, '啟用狀態已鎖定'):
-                manage_election(action, str(candidate.pk))
-        self.assertEqual(ballot.choices.count(), 0)
-        manage_election('clear', '清除全部選票')
-        self.voter.refresh_from_db()
-        candidate.refresh_from_db()
-        self.assertFalse(self.voter.is_active)
-        self.assertFalse(candidate.is_active)
-        self.assertEqual(password_for(self.voter), self.password)
-        manage_election('enable_candidate', str(candidate.pk))
-        candidate.refresh_from_db()
-        self.assertTrue(candidate.is_active)
-
-    def test_open_requires_active_candidate_and_new_records_default_active(self):
-        self.assertTrue(self.voter.is_active)
-        self.assertTrue(self.admin.is_active)
-        self.assertTrue(all(c.is_active for c in self.candidates))
-        manage_election('close')
-        for candidate in self.candidates:
-            manage_election('disable_candidate', str(candidate.pk))
-        with self.assertRaisesMessage(ValidationError, '至少需要一位已啟用候選人'):
-            manage_election('open')
-        self.assertFalse(Election.objects.get(pk=1).is_open)
-        manage_election('enable_candidate', str(self.candidates[0].pk))
-        manage_election('open')
-        self.assertTrue(Election.objects.get(pk=1).is_open)
-
-    def test_batch_create_users_and_candidates(self):
-        client = Client()
-        client.post('/', {'password': self.admin_password})
-        names = ['陳大文', '李小明', '王小華']
-        for action, model in (('user', Identity), ('candidate', Candidate)):
-            with self.subTest(action=action):
-                response = client.post('/manage/', {'action': action, 'name': ' 陳大文,李小明, 王小華 '})
-                self.assertRedirects(response, '/manage/')
-                self.assertEqual(list(model.objects.filter(name__in=names).values_list('name', flat=True)), names)
-        users = list(Identity.objects.filter(name__in=names))
-        self.assertEqual(len({password_for(user) for user in users}), 3)
-        for user in users:
-            self.assertFalse(user.is_admin)
-            self.assertEqual(authenticate(password_for(user), '192.0.2.1')[0], user)
-        submit_ballot(self.voter, [], 1, True)
-        response = client.post('/manage/', {'action': 'candidate', 'name': '鎖定一,鎖定二'}, follow=True)
-        self.assertContains(response, '已有選票，候選人名單已鎖定。')
-        self.assertFalse(Candidate.objects.filter(name__startswith='鎖定').exists())
-
-    def test_invalid_batch_creates_nothing(self):
-        client = Client()
-        client.post('/', {'password': self.admin_password})
-        for action, model in (('user', Identity), ('candidate', Candidate)):
-            for value in ('', '有效姓名,', ',有效姓名', '有效姓名, ,另一位', '有效姓名,' + '長' * 81):
-                with self.subTest(action=action, value=value):
-                    count = model.objects.count()
-                    response = client.post('/manage/', {'action': action, 'name': value}, follow=True)
-                    self.assertContains(response, '每個姓名須為 1 至 80 字元')
-                    self.assertEqual(model.objects.count(), count)
-
-    def test_batch_users_roll_back_if_creation_fails(self):
-        count = Identity.objects.count()
-        with patch('election.services.create_identity', wraps=create_identity) as create:
-            def create_or_fail(name):
-                if name == '失敗用戶':
-                    raise ValidationError('建立失敗')
-                return create_identity(name)
-            create.side_effect = create_or_fail
-            with self.assertRaises(ValidationError):
-                manage_election('user', '暫存用戶,失敗用戶')
-        self.assertEqual(Identity.objects.count(), count)
-
-    def test_reset_requires_admin_confirmation_and_preserves_admin_logins(self):
-        other_admin, other_password = create_identity('另一位管理員', True)
-        submit_ballot(self.voter, [self.candidates[0].pk], 1)
-        fields = {'action': 'reset', 'confirmation': '清除全部資料'}
-        self.assertEqual(self.client.post('/manage/', fields).status_code, 403)
-        admin_client = Client()
-        admin_client.post('/', {'password': self.admin_password})
-        session_key = admin_client.session.session_key
-        response = admin_client.get('/manage/')
-        self.assertContains(response, '清除全部資料並保留管理員')
-        self.assertContains(response, 'data-confirm=')
-        self.assertContains(response, 'type="hidden" name="confirmation" value="清除全部資料"')
-        self.assertNotContains(response, '請輸入「清除全部資料」')
-        self.assertEqual(admin_client.get('/manage/', fields).status_code, 200)
-        admin_client.post('/manage/', {'action': 'reset', 'confirmation': 'wrong'})
-        self.assertTrue(Ballot.objects.exists())
-        self.assertTrue(Identity.objects.filter(pk=self.voter.pk).exists())
-        self.assertEqual(Candidate.objects.count(), 11)
-        self.assertEqual(Election.objects.get(pk=1).version, 1)
-        response = admin_client.post('/manage/', fields)
-        self.assertRedirects(response, '/manage/')
-        self.assertEqual(admin_client.session.session_key, session_key)
-        self.assertEqual(set(Identity.objects.values_list('pk', flat=True)), {self.admin.pk, other_admin.pk})
-        self.assertFalse(Ballot.objects.exists())
-        self.assertFalse(Choice.objects.exists())
-        self.assertFalse(Candidate.objects.exists())
-        election = Election.objects.get(pk=1)
-        self.assertFalse(election.is_open)
-        self.assertEqual(election.version, 2)
-        self.assertRedirects(self.client.get('/vote/'), '/')
-        self.assertIsNone(authenticate(self.password, '192.0.2.1')[0])
-        for admin, password in ((self.admin, self.admin_password), (other_admin, other_password)):
-            self.assertEqual(authenticate(password, '192.0.2.2')[0], admin)
-
-    def test_reset_rolls_back_on_deletion_failure(self):
-        submit_ballot(self.voter, [self.candidates[0].pk], 1)
-        with patch('election.services.Candidate.objects.all') as candidates:
-            candidates.return_value.delete.side_effect = OperationalError('database is locked')
-            with self.assertRaises(OperationalError):
-                manage_election('reset', '清除全部資料')
-        self.assertTrue(Identity.objects.filter(pk=self.voter.pk).exists())
-        self.assertEqual(Candidate.objects.count(), 11)
-        self.assertEqual(Ballot.objects.get(voter=self.voter).choices.count(), 1)
-        election = Election.objects.get(pk=1)
-        self.assertTrue(election.is_open)
-        self.assertEqual(election.version, 1)
-
-    def test_reset_restarts_ids_and_revokes_sessions_before_id_reuse(self):
-        old_voter, password = create_identity('將刪除的用戶')
-        old_client = Client()
-        old_client.post('/', {'password': password})
-        old_session_key = old_client.session.session_key
-        # Advance every sequence beyond the rows that will remain after reset.
-        create_identity('另一位用戶')
-        submit_ballot(self.voter, [self.candidates[0].pk], 1)
-        submit_ballot(old_voter, [self.candidates[1].pk], 1)
-        authenticate('00000', '192.0.2.1')
-        self.assertTrue(LoginAttempt.objects.exists())
-        manage_election('reset', '清除全部資料')
-        self.assertFalse(LoginAttempt.objects.exists())
-        self.assertFalse(Session.objects.filter(session_key=old_session_key).exists())
-        voter, _ = create_identity('新用戶')
-        self.assertEqual(voter.pk, self.admin.pk + 1)
-        self.assertEqual(voter.pk, old_voter.pk)
-        self.assertRedirects(old_client.get('/vote/'), '/')
-        candidate = Candidate.objects.create(name='新候選人')
-        self.assertEqual(candidate.pk, 1)
-        manage_election('open')
-        with self.assertRaises(ValidationError):
-            submit_ballot(voter, [candidate.pk], 1)
-        ballot = submit_ballot(voter, [candidate.pk], 2)
-        self.assertEqual(ballot.pk, 1)
-        self.assertEqual(Choice.objects.get(ballot=ballot).pk, 1)
-
-    def test_reset_rolls_back_if_sequence_reset_fails(self):
-        submit_ballot(self.voter, [self.candidates[0].pk], 1)
-        session_key = self.client.session.session_key
-        authenticate('00000', '192.0.2.1')
-        with patch('election.services.connection.ops.sequence_reset_by_name_sql', side_effect=OperationalError('reset failed')):
-            with self.assertRaises(OperationalError):
-                manage_election('reset', '清除全部資料')
-        self.assertTrue(Session.objects.filter(session_key=session_key).exists())
-        self.assertTrue(LoginAttempt.objects.exists())
-        self.assertTrue(Identity.objects.filter(pk=self.voter.pk).exists())
-        self.assertEqual(Candidate.objects.count(), 11)
-        self.assertEqual(Ballot.objects.get(voter=self.voter).choices.count(), 1)
-        self.assertEqual(Election.objects.get(pk=1).version, 1)
-
-    def test_roles_login_logout_and_cache(self):
-        anonymous = Client()
-        for path in ('/vote/', '/manage/', '/credentials/'):
-            self.assertEqual(anonymous.get(path).status_code, 302)
-        self.assertEqual(self.client.get('/manage/').status_code, 403)
-        self.assertEqual(self.client.post('/credentials/').status_code, 403)
-        response = anonymous.post('/', {'password': self.admin_password.lower()})
-        self.assertRedirects(response, '/manage/')
-        self.assertEqual(anonymous.get('/vote/').status_code, 403)
-        response = anonymous.get('/manage/')
-        self.assertIn('no-store', response['Cache-Control'])
-        self.assertContains(response, '用戶與登入憑證')
-        self.assertEqual(anonymous.get('/logout/').status_code, 405)
-        anonymous.post('/logout/')
-        self.assertEqual(anonymous.get('/manage/').status_code, 302)
-
-    def test_dashboard_reveals_only_one_password_on_request(self):
-        other, other_password = create_identity('另一位用戶')
-        client = Client()
-        client.post('/', {'password': self.admin_password})
-        with patch('election.views.password_for', wraps=password_for) as decrypt:
-            response = client.get('/manage/')
-            decrypt.assert_not_called()
-            self.assertFalse(any(hasattr(user, 'password_display') for user in response.context['users']))
-            self.assertNotContains(response, f'<code>{self.password}</code>')
-            self.assertNotContains(response, f'<code>{other_password}</code>')
-            self.assertContains(response, '顯示密碼')
-            response = client.get('/manage/', {'reveal': self.voter.pk})
-            self.assertEqual(decrypt.call_count, 1)
-            self.assertContains(response, f'<code>{self.password}</code>')
-            self.assertNotContains(response, f'<code>{other_password}</code>')
-            self.assertContains(response, '隱藏密碼')
-            response = client.get('/manage/', {'reveal': other.pk})
-            self.assertContains(response, f'<code>{other_password}</code>')
-            self.assertNotContains(response, f'<code>{self.password}</code>')
-            for reveal in ('', 'bad', str(self.admin.pk), '999999999999999999999999'):
-                response = client.get('/manage/', {'reveal': reveal})
-                self.assertFalse(any(hasattr(user, 'password_display') for user in response.context['users']))
-        self.assertIn('no-store', response['Cache-Control'])
-        self.assertEqual(self.client.get('/manage/', {'reveal': other.pk}).status_code, 403)
-        response = Client().get('/manage/', {'reveal': self.voter.pk})
-        self.assertEqual(response.status_code, 302)
 
     def test_csrf_and_session_rotation(self):
         client = Client(enforce_csrf_checks=True)
@@ -469,7 +326,8 @@ class VotingTests(TestCase):
         self.assertEqual(client.session['identity'], self.voter.pk)
         self.assertNotEqual(client.session.session_key, old_key)
         self.assertNotEqual(client.cookies['csrftoken'].value, token)
-        other, password = create_identity('另一個帳戶')
+        other = Identity.objects.get(number=2)
+        password = password_for(other)
         client.get('/?qr=1')
         token = client.cookies['csrftoken'].value
         response = client.post('/?qr=1', {'password': '00000', 'csrfmiddlewaretoken': token})
@@ -521,108 +379,10 @@ class VotingTests(TestCase):
         self.assertEqual(client_ip(factory.get('/', REMOTE_ADDR='172.20.0.2', HTTP_X_REAL_IP='192.0.2.99')), '192.0.2.99')
         self.assertEqual(client_ip(factory.get('/', REMOTE_ADDR='172.20.0.2', HTTP_X_REAL_IP='bad')), '172.20.0.2')
 
-    def test_results_ties_blank_and_privacy(self):
-        other, _ = create_identity('另一位')
-        submit_ballot(self.voter, [c.pk for c in self.candidates[:2]], 1)
-        submit_ballot(other, [], 1, True)
-        session = self.client.session
-        session['identity'] = self.admin.pk
-        session.save()
-        for action in ('open', 'close', 'open'):
-            manage_election(action)
-            response = self.client.get('/manage/')
-            self.assertFalse(any(hasattr(user, 'selected') for user in response.context['users']))
-            if action == 'open':
-                self.assertEqual((response.context['total'], response.context['voted'], response.context['unvoted']), (2, 2, 0))
-                self.assertIsNone(response.context['blank'])
-                self.assertFalse(any(hasattr(candidate, 'votes') or hasattr(candidate, 'rank') for candidate in response.context['results']))
-                self.assertEqual([candidate.pk for candidate in response.context['results']], [candidate.pk for candidate in self.candidates])
-                self.assertNotContains(response, '<th>票數</th>')
-                self.assertNotContains(response, '<th>名次</th>')
-                self.assertNotContains(response, '空白票')
-                self.assertContains(response, '投票結束後才顯示票數及名次。')
-            else:
-                self.assertContains(response, '<th>票數</th>')
-                self.assertContains(response, '<th>名次</th>')
-                self.assertContains(response, '空白票')
-                self.assertEqual([(c.votes, c.rank) for c in response.context['results'][:3]], [(1, 1), (1, 1), (0, 3)])
-        manage_election('close')
-        response = self.client.get('/manage/')
-        self.assertEqual((response.context['total'], response.context['voted'], response.context['unvoted'], response.context['blank']), (2, 2, 0, 1))
-        self.assertEqual([(c.votes, c.rank) for c in response.context['results'][:3]], [(1, 1), (1, 1), (0, 3)])
-        self.assertFalse(any(hasattr(user, 'selected') for user in response.context['users']))
 
-    def test_post_validation_and_atomic_rollback(self):
-        selected = [str(self.candidates[0].pk)]
-        self.assertRedirects(self.client.post('/vote/', {'candidate': selected, 'version': 1}), '/vote/')
-        with patch('election.services.Choice.objects.bulk_create', side_effect=OperationalError('database is locked')):
-            response = self.client.post('/vote/', {'candidate': [self.candidates[1].pk], 'version': 1})
-        self.assertEqual(response.status_code, 503)
-        self.assertEqual(list(Ballot.objects.get(voter=self.voter).choices.values_list('pk', flat=True)), [int(selected[0])])
-        self.assertContains(self.client.post('/vote/', {'candidate': 'bad', 'version': 1}), '候選人資料無效')
-
-    def test_display_numbers_start_at_one_and_match_selected_pdf(self):
-        from pypdf import PdfReader
-        manage_election('reset', '清除全部資料')
-        first, password = create_identity('第一位')
-        create_identity('額外管理員', True)
-        second, _ = create_identity('第二位')
-        self.assertGreater(first.pk, 1)
-        client = Client()
-        client.post('/', {'password': self.admin_password})
-        response = client.get('/manage/')
-        self.assertEqual([(user.pk, user.display_number) for user in response.context['users']], [(first.pk, 1), (second.pk, 2)])
-        self.assertContains(response, '編號 1')
-        self.assertContains(response, '編號 2')
-        self.assertContains(response, f'name="users" value="{first.pk}"')
-        for ids, expected in (([first.pk, second.pk], ['第一位（#1）', '第二位（#2）']), ([second.pk], ['第二位（#2）'])):
-            response = client.post('/credentials/', {'scope': 'selected', 'users': ids})
-            text = PdfReader(BytesIO(response.content)).pages[0].extract_text()
-            for name in expected:
-                self.assertIn(name, text)
-        voter_client = Client()
-        voter_client.post('/', {'password': password})
-        self.assertContains(voter_client.get('/vote/'), '第一位 · #1')
-
-    @override_settings(PUBLIC_URL='https://vote.hcmc.nz')
-    def test_pdf_qr_matches_each_users_login_credential(self):
-        from reportlab.graphics.barcode.qr import QrCodeWidget
-        from .pdf import credential_pdf
-        other, password = create_identity('另一位用戶')
-        with patch('election.pdf.QrCodeWidget', wraps=QrCodeWidget) as qr:
-            credential_pdf([self.voter, other])
-        self.assertEqual([call.args[0] for call in qr.call_args_list], [
-            f'https://vote.hcmc.nz/#password={self.password}',
-            f'https://vote.hcmc.nz/#password={password}',
-        ])
-
-    def test_pdf_all_selected_and_long_names(self):
-        from pypdf import PdfReader
-        for _ in range(12):
-            create_identity('陳王李張劉林黃吳周徐' * 8)
-        session = self.client.session
-        session['identity'] = self.admin.pk
-        session.save()
-        response = self.client.post('/credentials/', {'scope': 'all'})
-        self.assertEqual(response.status_code, 200)
-        self.assertIn('no-store', response['Cache-Control'])
-        reader = PdfReader(BytesIO(response.content))
-        self.assertEqual(len(reader.pages), 2)
-        self.assertEqual(reader.pages[0].extract_text().count('登入憑證'), 12)
-        self.assertEqual(reader.pages[1].extract_text().count('登入憑證'), 1)
-        self.assertIn(self.voter.name, reader.pages[0].extract_text())
-        self.assertIn(self.password, reader.pages[0].extract_text())
-        response = self.client.post('/credentials/', {'scope': 'selected', 'users': [self.voter.pk, self.admin.pk]})
-        self.assertEqual(len(PdfReader(BytesIO(response.content)).pages), 1)
-        self.assertNotIn(self.admin_password, PdfReader(BytesIO(response.content)).pages[0].extract_text())
-        self.assertEqual(self.client.post('/credentials/', {'scope': 'selected'}).status_code, 302)
-
-
-class ConcurrencyTests(TransactionTestCase):
+class ConcurrencyTests(RoundMixin, TransactionTestCase):
     def setUp(self):
-        Election.objects.update_or_create(pk=1, defaults={'is_open': True, 'version': 1})
-        self.voter, _ = create_identity('並行測試')
-        self.candidates = [Candidate.objects.create(name=f'並行候選人{i}') for i in range(2)]
+        self.setup_round()
 
     def race(self, *operations):
         barrier = threading.Barrier(len(operations))
@@ -641,47 +401,96 @@ class ConcurrencyTests(TransactionTestCase):
             return list(pool.map(run, operations))
 
     def test_simultaneous_revotes_leave_one_complete_ballot(self):
-        results = self.race(*(lambda c=c: submit_ballot(self.voter, [c.pk], 1) for c in self.candidates))
+        fields = self.fields()
+        results = self.race(*(lambda c=c: submit_ballot(self.voter, [c.pk], **fields) for c in self.candidates[:2]))
         self.assertEqual(results, ['ok', 'ok'])
         self.assertEqual(Ballot.objects.count(), 1)
         self.assertEqual(Ballot.objects.get().choices.count(), 1)
 
-    def test_close_races_submit(self):
-        results = self.race(lambda: manage_election('close'), lambda: submit_ballot(self.voter, [self.candidates[0].pk], 1))
-        self.assertEqual(results[0], 'ok')
+    def test_close_races_submit_and_rejects_old_lifecycle(self):
+        fields=self.fields()
+        results=self.race(lambda: manage_election('close',**fields), lambda: submit_ballot(self.voter,[],**fields,blank_confirmed=True))
+        self.assertEqual(results[0],'ok')
         self.assertFalse(Election.objects.get().is_open)
-        self.assertEqual(Ballot.objects.count(), int(results[1] == 'ok'))
+        self.assertEqual(Ballot.objects.count(),int(results[1]=='ok'))
+        with self.assertRaises(ValidationError): manage_election('open',**fields)
 
-    def test_clear_races_submit_then_rejects_stale(self):
-        self.race(lambda: manage_election('clear', '清除全部選票'), lambda: submit_ballot(self.voter, [self.candidates[0].pk], 1))
-        self.assertEqual(Ballot.objects.count(), 0)
-        manage_election('open')
-        with self.assertRaises(ValidationError):
-            submit_ballot(self.voter, [], 1, True)
+    def test_clear_races_submit(self):
+        fields=self.fields()
+        self.race(lambda: manage_election('clear','清除本輪選票',**fields),lambda: submit_ballot(self.voter,[],**fields,blank_confirmed=True))
+        self.assertEqual(Ballot.objects.count(),0)
+        self.assertFalse(Election.objects.get().is_open)
 
-    def test_candidate_races_first_ballot(self):
-        results = self.race(lambda: manage_election('candidate', '新增候選人'), lambda: submit_ballot(self.voter, [], 1, True))
-        self.assertEqual(results[1], 'ok')
-        self.assertEqual(Candidate.objects.count(), 3 if results[0] == 'ok' else 2)
-        with self.assertRaises(ValidationError):
-            manage_election('candidate', '投票後不得新增')
+    def test_simultaneous_create_allows_only_one_new_round(self):
+        self.manage('close')
+        fields=self.fields()
+        def create():
+            manage_election('create',**fields,title=self.election.title,selected=[self.candidates[0].pk],maximum=1)
+        self.assertEqual(sorted(self.race(create,create)),['ok','rejected'])
+        self.assertEqual(Election.objects.filter(is_open=True).count(),1)
+        self.assertEqual(Election.objects.count(),2)
 
-    def test_candidate_status_races_first_blank_ballot(self):
-        candidate = self.candidates[0]
-        results = self.race(lambda: manage_election('disable_candidate', str(candidate.pk)), lambda: submit_ballot(self.voter, [], 1, True))
-        self.assertEqual(results[1], 'ok')
-        candidate.refresh_from_db()
-        self.assertEqual(candidate.is_active, results[0] != 'ok')
-        with self.assertRaises(ValidationError):
-            manage_election('enable_candidate', str(candidate.pk))
+    def test_disable_races_submit(self):
+        fields=self.fields()
+        result=self.race(lambda: manage_election('disable_user',str(self.voter.pk),**fields),lambda: submit_ballot(self.voter,[],**fields,blank_confirmed=True))
+        self.assertEqual(result[0],'ok')
+        self.assertEqual(Ballot.objects.count(),int(result[1]=='ok'))
+        with self.assertRaises(ValidationError): self.submit(blank=True)
+
+    def test_database_enforces_one_open_round(self):
+        with self.assertRaises(IntegrityError),transaction.atomic():
+            Election.objects.create(title='不能同時開放',max_votes=1,is_open=True)
+
+    def test_backup_restore_rounds_and_session_revocation(self):
+        self.submit([self.candidates[0].pk])
+        self.manage('close')
+        second=self.manage('create',title=self.election.title,selected=[self.candidates[1].pk],maximum=1)
+        self.submit(blank=True)
+        client=Client();client.post('/',{'password':self.password})
+        output=StringIO(); call_command('backup_db',stdout=output)
+        backup=Path(output.getvalue().strip())
+        try:
+            self.manage('clear','清除本輪選票')
+            call_command('restore_db',str(backup),confirm='還原資料庫',stdout=StringIO())
+            self.assertEqual(Ballot.objects.count(),2)
+            self.assertFalse(Election.objects.filter(is_open=True).exists())
+            self.assertEqual(Election.objects.get(pk=second.pk).version,2)
+            self.assertFalse(Session.objects.exists())
+            self.assertEqual(backup.stat().st_mode & 0o777,0o600)
+        finally: backup.unlink(missing_ok=True)
+
+    def test_setup_backs_up_and_rebuilds_preserving_admin(self):
+        self.submit(blank=True)
+        output=StringIO()
+        call_command('setup_election',confirm='清除全部資料',stdout=output)
+        backup=Path(output.getvalue().splitlines()[0])
+        try:
+            with sqlite3.connect(backup) as db:
+                self.assertEqual(db.execute('SELECT COUNT(*) FROM election_ballot').fetchone()[0],1)
+            self.assertTrue(Identity.objects.filter(pk=self.admin.pk,is_admin=True).exists())
+            self.assertEqual(Identity.objects.filter(is_admin=False).count(),19)
+            self.assertFalse(Election.objects.exists())
+        finally: backup.unlink(missing_ok=True)
+        with self.assertRaises(CommandError): call_command('setup_election',confirm='wrong')
+
+    def test_old_schema_backup_is_rejected_without_overwriting_database(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            backup=Path(folder)/'old.sqlite3'
+            with sqlite3.connect(backup) as db:
+                for table in ('election_identity','election_election','election_ballot'):
+                    db.execute(f'CREATE TABLE {table} (id INTEGER)')
+            with self.assertRaisesMessage(CommandError,'不相容'):
+                call_command('restore_db',str(backup),confirm='還原資料庫')
+        self.assertEqual(Identity.objects.filter(is_admin=False).count(),19)
 
     def test_voter_disabling_and_submission_follow_transaction_order(self):
-        disable = lambda: manage_election('disable_user', str(self.voter.pk))
-        submit = lambda: submit_ballot(self.voter, [self.candidates[1].pk], 1)
+        disable = lambda: self.manage('disable_user', str(self.voter.pk))
+        submit = lambda: self.submit([self.candidates[1].pk])
         for disable_first in (True, False):
             with self.subTest(disable_first=disable_first):
-                manage_election('enable_user', str(self.voter.pk))
-                ballot = submit_ballot(self.voter, [self.candidates[0].pk], 1)
+                self.manage('enable_user', str(self.voter.pk))
+                ballot = self.submit([self.candidates[0].pk])
                 held, attempted, release = threading.Event(), threading.Event(), threading.Event()
                 first, second = (disable, submit) if disable_first else (submit, disable)
                 def hold_first():
@@ -724,14 +533,14 @@ class ConcurrencyTests(TransactionTestCase):
                 self.assertEqual(list(ballot.choices.all()), [self.candidates[0 if disable_first else 1]])
 
     def test_real_sqlite_lock_timeout_preserves_ballot(self):
-        submit_ballot(self.voter, [self.candidates[0].pk], 1)
+        self.submit([self.candidates[0].pk])
         def blocked_submit():
             connection = connections['default']
             try:
                 with connection.cursor() as cursor:
                     cursor.execute('PRAGMA busy_timeout = 50')
                 with self.assertRaises(OperationalError):
-                    submit_ballot(self.voter, [self.candidates[1].pk], 1)
+                    self.submit([self.candidates[1].pk])
             finally:
                 connection.close()
         lock = sqlite3.connect(connections['default'].settings_dict['NAME'])
@@ -743,18 +552,3 @@ class ConcurrencyTests(TransactionTestCase):
             lock.rollback()
             lock.close()
         self.assertEqual(list(Ballot.objects.get().choices.all()), [self.candidates[0]])
-
-    def test_backup_and_restore(self):
-        submit_ballot(self.voter, [self.candidates[0].pk], 1)
-        output = StringIO()
-        call_command('backup_db', stdout=output)
-        backup = Path(output.getvalue().strip())
-        try:
-            manage_election('clear', '清除全部選票')
-            call_command('restore_db', str(backup), confirm='還原資料庫', stdout=StringIO())
-            self.assertEqual(Ballot.objects.count(), 1)
-            self.assertFalse(Election.objects.get().is_open)
-            self.assertEqual(Election.objects.get().version, 2)
-            self.assertEqual(backup.stat().st_mode & 0o777, 0o600)
-        finally:
-            backup.unlink(missing_ok=True)

@@ -7,8 +7,7 @@ from cryptography.fernet import Fernet
 from django.conf import settings
 from django.contrib.sessions.models import Session
 from django.core.exceptions import ValidationError
-from django.core.management.color import no_style
-from django.db import connection, transaction
+from django.db import transaction
 from django.utils import timezone
 
 from .models import Ballot, Candidate, Choice, Election, Identity, LoginAttempt
@@ -25,20 +24,20 @@ def password_for(identity):
 
 
 def voter_numbers():
-    return {pk: number for number, pk in enumerate(Identity.objects.filter(is_admin=False).values_list('pk', flat=True), 1)}
+    return dict(Identity.objects.filter(is_admin=False).values_list('pk', 'number'))
 
 
 @transaction.atomic
-def create_identity(name, is_admin=False):
-    name = name.strip()
-    if not name or len(name) > 80:
+def create_identity(name='', is_admin=False, number=None):
+    name = name.strip() if is_admin else ''
+    if (is_admin and (not name or len(name) > 80)) or (not is_admin and (type(number) is not int or not 1 <= number <= 19)):
         raise ValidationError('姓名須為 1 至 80 字元。')
     while True:
         password = ''.join(secrets.choice(ALPHABET) for _ in range(5))
         index = digest(password)
         if not Identity.objects.filter(password_index=index).exists():
             break
-    identity = Identity.objects.create(name=name, is_admin=is_admin, password_index=index, encrypted_password='' if is_admin else Fernet(settings.PASSWORD_ENCRYPTION_KEY.encode()).encrypt(password.encode()).decode())
+    identity = Identity.objects.create(name=name, number=None if is_admin else number, is_admin=is_admin, password_index=index, encrypted_password='' if is_admin else Fernet(settings.PASSWORD_ENCRYPTION_KEY.encode()).encrypt(password.encode()).decode())
     return identity, password
 
 
@@ -61,8 +60,8 @@ def authenticate(password, ip):
 
 
 @transaction.atomic
-def submit_ballot(voter, selected, version, blank_confirmed=False):
-    election = Election.objects.get(pk=1)
+def submit_ballot(voter, selected, election_id, version, blank_confirmed=False):
+    election = current_election(election_id, version)
     voter = Identity.objects.filter(pk=voter.pk).first()
     if voter is None:
         raise ValidationError('用戶資料無效。')
@@ -70,76 +69,92 @@ def submit_ballot(voter, selected, version, blank_confirmed=False):
         raise ValidationError('管理員不能投票。')
     if not voter.is_active:
         raise ValidationError('你的投票權限已停用，仍可查看已提交的選票。')
-    if str(election.version) != str(version):
-        raise ValidationError('投票資料已重設，請重新載入頁面。')
     if not election.is_open:
         raise ValidationError('投票已關閉，未更改選票。')
     try:
         ids = [int(value) for value in selected]
     except (ValueError, TypeError):
         raise ValidationError('候選人資料無效。') from None
-    if len(ids) > 10 or len(ids) != len(set(ids)) or Candidate.objects.filter(pk__in=ids, is_active=True).count() != len(ids):
-        raise ValidationError('請選擇最多 10 位有效候選人，不可重複。')
+    if len(ids) > election.max_votes or len(ids) != len(set(ids)) or election.candidates.filter(pk__in=ids).count() != len(ids):
+        raise ValidationError(f'請選擇最多 {election.max_votes} 位有效候選人，不可重複。')
     if not ids and not blank_confirmed:
         raise ValidationError('提交空白票前，請勾選確認。')
-    ballot, _ = Ballot.objects.get_or_create(voter=voter)
+    ballot, _ = Ballot.objects.get_or_create(election=election, voter=voter)
     ballot.choices.clear()
     Choice.objects.bulk_create([Choice(ballot=ballot, candidate_id=pk) for pk in ids])
     ballot.save()
     return ballot
 
 
+def current_election(election_id, version):
+    election = Election.objects.order_by('-pk').first()
+    if election is None or str(election.pk) != str(election_id) or str(election.version) != str(version):
+        raise ValidationError('輪次資料已過期，請重新載入頁面。')
+    return election
+
+
 @transaction.atomic
-def manage_election(action, value=''):
-    election = Election.objects.get(pk=1)
-    if action in ('candidate', 'user'):
-        if action == 'candidate' and Ballot.objects.exists():
-            raise ValidationError('已有選票，候選人名單已鎖定。')
-        names = [name.strip() for name in value.split(',')]
-        if any(not name or len(name) > 80 for name in names):
-            raise ValidationError('每個姓名須為 1 至 80 字元，以逗號分隔，不可留空。')
-        if action == 'candidate':
-            Candidate.objects.bulk_create([Candidate(name=name) for name in names])
-        else:
-            for name in names:
-                create_identity(name)
-    elif action in ('enable_user', 'disable_user', 'enable_candidate', 'disable_candidate'):
+def fresh_setup():
+    old_indexes = set(Identity.objects.filter(is_admin=False).values_list('password_index', flat=True))
+    Ballot.objects.all().delete()
+    Election.objects.all().delete()
+    Identity.objects.filter(is_admin=False).delete()
+    Candidate.objects.all().delete()
+    LoginAttempt.objects.all().delete()
+    admin_ids = set(Identity.objects.filter(is_admin=True).values_list('pk', flat=True))
+    for session in Session.objects.iterator():
+        if session.get_decoded().get('identity') not in admin_ids:
+            session.delete()
+    Candidate.objects.bulk_create([Candidate(name=name) for name in settings.CANDIDATE_NAMES])
+    for number in range(1, 20):
+        while True:
+            user, _ = create_identity(number=number)
+            if user.password_index not in old_indexes:
+                break
+            user.delete()
+
+
+@transaction.atomic
+def manage_election(action, value='', *, election_id=None, version=None, title='', selected=(), maximum=None):
+    latest = Election.objects.order_by('-pk').first()
+    if latest:
+        election = current_election(election_id, version)
+    elif str(election_id) != '0' or str(version) != '0':
+        raise ValidationError('輪次資料已過期，請重新載入頁面。')
+    else:
+        election = None
+    if action == 'create':
+        if latest and latest.is_open:
+            raise ValidationError('請先關閉目前輪次。')
+        try:
+            ids = [int(pk) for pk in selected]
+            limit = int(maximum)
+        except (ValueError, TypeError):
+            raise ValidationError('輪次設定無效。') from None
+        if title not in settings.ELECTION_TITLES or not 1 <= len(ids) <= 19 or len(set(ids)) != len(ids) or Candidate.objects.filter(pk__in=ids).count() != len(ids) or not 1 <= limit <= len(ids):
+            raise ValidationError('請選擇 1 至 19 位候選人，上限須為 1 至候選人人數。')
+        election = Election.objects.create(title=title, max_votes=limit, is_open=True)
+        election.candidates.set(ids)
+    elif action in ('enable_user', 'disable_user'):
         if not value.isdecimal() or len(value) > 12:
             raise ValidationError('啟用／停用對象無效。')
-        is_candidate = action.endswith('_candidate')
-        targets = Candidate.objects.all() if is_candidate else Identity.objects.filter(is_admin=False)
-        target = targets.filter(pk=value).first()
+        target = Identity.objects.filter(pk=value, is_admin=False).first()
         if target is None:
             raise ValidationError('啟用／停用對象無效，管理員帳戶不能停用。')
-        if is_candidate and Ballot.objects.exists():
-            raise ValidationError('已有選票，候選人名單及啟用狀態已鎖定。')
-        target.is_active = action.startswith('enable_')
+        target.is_active = action == 'enable_user'
         target.save(update_fields=['is_active'])
-    elif action == 'open':
-        if not Candidate.objects.filter(is_active=True).exists():
-            raise ValidationError('至少需要一位已啟用候選人才可開放。')
-        election.is_open = True
-    elif action == 'close':
-        election.is_open = False
-    elif action in ('clear', 'reset'):
-        confirmation = '清除全部資料' if action == 'reset' else '清除全部選票'
-        if value != confirmation:
-            raise ValidationError(f'請確認「{confirmation}」操作。')
-        Ballot.objects.all().delete()
-        if action == 'reset':
-            Identity.objects.filter(is_admin=False).delete()
-            Candidate.objects.all().delete()
-            LoginAttempt.objects.all().delete()
-            admin_ids = set(Identity.objects.values_list('pk', flat=True))
-            for session in Session.objects.iterator():
-                if session.get_decoded().get('identity') not in admin_ids:
-                    session.delete()
-            sequences = [{'table': model._meta.db_table} for model in (Identity, Candidate, Ballot, Choice)]
-            with connection.cursor() as cursor:
-                for sql in connection.ops.sequence_reset_by_name_sql(no_style(), sequences):
-                    cursor.execute(sql)
-        election.is_open = False
+    elif action == 'reset':
+        if value != '清除全部資料':
+            raise ValidationError('請確認「清除全部資料」操作。')
+        fresh_setup()
+    elif election and action in ('open', 'close', 'clear'):
+        if action == 'clear':
+            if value != '清除本輪選票':
+                raise ValidationError('請確認「清除本輪選票」操作。')
+            election.ballot_set.all().delete()
+        election.is_open = action == 'open'
         election.version += 1
+        election.save(update_fields=['is_open', 'version'])
     else:
         raise ValidationError('無效操作。')
-    election.save()
+    return election

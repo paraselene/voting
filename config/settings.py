@@ -55,3 +55,11 @@ PDF_FONT_PATH = os.environ.get('PDF_FONT_PATH', str(BASE_DIR / 'fonts/NotoSansTC
 TRUSTED_PROXY_IPS = os.environ.get('TRUSTED_PROXY_IPS', '').split(',')
 CSRF_FAILURE_VIEW = 'election.views.csrf_failure'
 DATA_UPLOAD_MAX_NUMBER_FIELDS = 5000
+
+# Ordered comma-separated configuration, saved into each new round.
+ELECTION_TITLES = [value.strip() for value in os.environ.get('ELECTION_TITLES', '10位執事,會友領袖,執事會主席,執事會副主席,文書,財政,宣教組組長,關懷組組長,基督教教育組組長,總務組,音樂與崇拜組,牧職關係委員會').split(',')]
+CANDIDATE_NAMES = [value.strip() for value in os.environ.get('CANDIDATE_NAMES', ','.join(f'候選人{i}' for i in range(1, 20))).split(',')]
+if not ELECTION_TITLES or any(not value or len(value) > 40 for value in ELECTION_TITLES) or len(set(ELECTION_TITLES)) != len(ELECTION_TITLES):
+    raise ImproperlyConfigured('ELECTION_TITLES 必須為逗號分隔、不重複的標題，每項 1 至 40 字。')
+if len(CANDIDATE_NAMES) != 19 or len(set(CANDIDATE_NAMES)) != 19 or any(not value or len(value) > 80 for value in CANDIDATE_NAMES):
+    raise ImproperlyConfigured('CANDIDATE_NAMES 必須為逗號分隔的 19 位不重複候選人，每項 1 至 80 字。')

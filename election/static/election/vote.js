@@ -26,15 +26,16 @@ document.querySelectorAll('form[data-confirm]').forEach(form => {
 
 const form = document.querySelector('#vote-form');
 if (form) {
+  const maximum = Number(form.dataset.maximum);
   const boxes = [...form.querySelectorAll('input[name="candidate"]')];
   const count = document.querySelector('#selection-count');
   const submit = document.querySelector('#submit-vote');
   function update() {
     const total = boxes.filter(box => box.checked).length;
-    count.textContent = `已選 ${total} / 10 位`;
+    count.textContent = `已選 ${total} / ${maximum} 位`;
     if (submit) {
-      submit.disabled = total > 10;
-      boxes.forEach(box => { box.disabled = total >= 10 && !box.checked; });
+      submit.disabled = total > maximum;
+      boxes.forEach(box => { box.disabled = total >= maximum && !box.checked; });
     }
   }
   boxes.forEach(box => box.addEventListener('change', update));
@@ -42,4 +43,26 @@ if (form) {
     if (!boxes.some(box => box.checked) && !window.confirm('你尚未選擇候選人。確定提交空白票？')) event.preventDefault();
   });
   update();
+}
+
+const createRound = document.querySelector('#create-round');
+if (createRound) {
+  const title = createRound.querySelector('[name="title"]');
+  const maximum = createRound.querySelector('[name="maximum"]');
+  const boxes = [...createRound.querySelectorAll('[name="candidate"]')];
+  function updateLimit() {
+    maximum.max = boxes.filter(box => box.checked).length;
+    maximum.value = Math.max(1, Math.min(Number(maximum.value), Number(maximum.max)));
+  }
+  title.addEventListener('change', () => {
+    maximum.value = title.value === '10位執事' ? 10 : 1;
+    updateLimit();
+  });
+  boxes.forEach(box => box.addEventListener('change', updateLimit));
+  createRound.querySelectorAll('[data-candidates]').forEach(button => {
+    button.addEventListener('click', () => {
+      boxes.forEach(box => { box.checked = button.dataset.candidates === 'all'; });
+      updateLimit();
+    });
+  });
 }

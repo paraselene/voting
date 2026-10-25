@@ -35,6 +35,9 @@ class Command(BaseCommand):
                 tables = {row[0] for row in src.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 if not {'election_identity', 'election_election', 'election_ballot'} <= tables:
                     raise CommandError('不是本系統的備份。')
+                columns = {row[1] for row in src.execute('PRAGMA table_info(election_election)')}
+                if not {'title', 'max_votes', 'created_at'} <= columns or 'election_election_candidates' not in tables:
+                    raise CommandError('備份版本不相容：需要新版多輪選舉資料庫。')
                 src.backup(dst)
                 # Restored credentials must never revive sessions from the backup.
                 dst.execute('DELETE FROM django_session')

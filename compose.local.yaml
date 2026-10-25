@@ -2,14 +2,16 @@
 services:
   voting-web:
     build: .
+    env_file:
+      - .env
     environment:
       DEBUG: "1"
       DATABASE_PATH: /data/db.sqlite3
       ALLOWED_HOSTS: localhost,127.0.0.1,testserver
-      PUBLIC_URL: http://localhost:18000
+      PUBLIC_URL: http://localhost:${VOTING_LOCAL_PORT:-18000}
     ports:
-      - "127.0.0.1:18000:8000"
+      - "127.0.0.1:${VOTING_LOCAL_PORT:-18000}:8000"
     volumes:
-      - ./data/local-docker:/data
+      - ${VOTING_LOCAL_DATA:-./data/local-docker}:/data
       - ./fonts:/app/fonts:ro
     restart: unless-stopped
