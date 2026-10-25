@@ -218,23 +218,23 @@ class VotingTests(RoundMixin, TestCase):
         second = self.manage('create', title=self.election.title, selected=[candidate.pk], maximum=1)
         self.assertEqual(second.number, 2)
 
-    def test_disabled_voter_qr_read_only_and_admin_permissions(self):
-        ballot = self.submit([self.candidates[0].pk])
-        self.manage('disable_user', str(self.voter.pk))
-        self.assertEqual(authenticate(self.password,'127.0.0.1')[0],self.voter)
-        self.client.get('/?qr=1')
-        self.client.post('/?qr=1',{'password':self.password})
-        page = self.client.get('/vote/')
-        self.assertEqual(page.context['ballot'],ballot)
-        self.assertContains(page,'<fieldset disabled>')
-        self.assertNotContains(page,'id="submit-vote"')
-        with self.assertRaises(ValidationError): self.submit(blank=True)
-        self.assertEqual(ballot.choices.count(),1)
-        with self.assertRaises(ValidationError): self.manage('disable_user',str(self.admin.pk))
-        self.assertEqual(self.client.post('/manage/',self.fields()|{'action':'close'}).status_code,403)
-        self.assertEqual(self.client.post('/credentials/',{'scope':'all'}).status_code,403)
-        self.manage('enable_user', str(self.voter.pk))
+
+    def test_voters_always_can_vote_and_removed_status_actions_are_rejected(self):
+        self.voter.is_active = False
+        self.voter.save(update_fields=['is_active'])
+        self.assertContains(self.client.get('/vote/'), 'id="submit-vote"')
         self.submit(blank=True)
+        admin = Client()
+        admin.post('/', {'password': self.admin_password})
+        for action in ('enable_user', 'disable_user'):
+            response = admin.post('/manage/', self.fields() | {'action': action, 'target': self.voter.pk}, follow=True)
+            self.assertContains(response, '無效操作')
+        page = admin.get('/manage/')
+        for removed in ('name="users"', '匯出勾選', 'enable_user', 'disable_user', '啟用', '停用'):
+            self.assertNotContains(page, removed)
+        self.assertContains(page, '匯出全部用戶 PDF')
+        self.assertEqual(self.client.post('/manage/', self.fields() | {'action': 'close'}).status_code, 403)
+        self.assertEqual(self.client.post('/credentials/', {}).status_code, 403)
 
     def test_csrf_on_lifecycle_and_credentials(self):
         client=Client(enforce_csrf_checks=True); client.get('/')
@@ -265,25 +265,27 @@ class VotingTests(RoundMixin, TestCase):
             self.assertNotContains(page, '<th>密碼</th>')
             self.assertFalse(any(hasattr(user, 'password_display') for user in page.context['users']))
 
-    def test_credentials_number_only_pdf_pagination_selected_and_qr(self):
+    def test_credentials_number_only_pdf_pagination_all_and_qr(self):
         from pypdf import PdfReader
         from reportlab.graphics.barcode.qr import QrCodeWidget
         from .pdf import credential_pdf
         admin=Client();admin.post('/',{'password':self.admin_password})
-        response=admin.post('/credentials/',{'scope':'all'})
+        response=admin.post('/credentials/',{})
         self.assertIn('no-store',response['Cache-Control'])
         pages=PdfReader(BytesIO(response.content)).pages
         self.assertEqual([p.extract_text().count('登入憑證') for p in pages],[8,8,3])
         self.assertNotIn('姓名', ''.join(p.extract_text() for p in pages))
         self.assertNotIn('最多選 10', ''.join(p.extract_text() for p in pages))
-        response=admin.post('/credentials/',{'users':[Identity.objects.get(number=19).pk,self.admin.pk]})
-        text=PdfReader(BytesIO(response.content)).pages[0].extract_text()
-        self.assertIn('投票者編號：19',text)
-        self.assertNotIn(self.admin_password,text)
+        for fields in ({'scope': 'selected', 'users': [self.voter.pk]}, {'users': ['bad']}):
+            response = admin.post('/credentials/', fields)
+            pages = PdfReader(BytesIO(response.content)).pages
+            self.assertEqual([p.extract_text().count('登入憑證') for p in pages], [8, 8, 3])
+            text = ''.join(p.extract_text() for p in pages)
+            self.assertIn('投票者編號：19', text)
+            self.assertNotIn(self.admin_password, text)
         with patch('election.pdf.QrCodeWidget',wraps=QrCodeWidget) as qr:
             credential_pdf([self.voter])
             self.assertEqual(qr.call_args.args[0],f'{settings.PUBLIC_URL}/#password={self.password}')
-        self.assertEqual(admin.post('/credentials/',{'users':['bad']}).status_code,400)
 
     def test_collision_retries(self):
         with patch('election.services.secrets.choice', side_effect=list(self.password + '22222')):
@@ -430,12 +432,6 @@ class ConcurrencyTests(RoundMixin, TransactionTestCase):
         self.assertEqual(Election.objects.filter(is_open=True).count(),1)
         self.assertEqual(Election.objects.count(),2)
 
-    def test_disable_races_submit(self):
-        fields=self.fields()
-        result=self.race(lambda: manage_election('disable_user',str(self.voter.pk),**fields),lambda: submit_ballot(self.voter,[],**fields,blank_confirmed=True))
-        self.assertEqual(result[0],'ok')
-        self.assertEqual(Ballot.objects.count(),int(result[1]=='ok'))
-        with self.assertRaises(ValidationError): self.submit(blank=True)
 
     def test_database_enforces_one_open_round(self):
         with self.assertRaises(IntegrityError),transaction.atomic():
@@ -484,53 +480,6 @@ class ConcurrencyTests(RoundMixin, TransactionTestCase):
                 call_command('restore_db',str(backup),confirm='還原資料庫')
         self.assertEqual(Identity.objects.filter(is_admin=False).count(),19)
 
-    def test_voter_disabling_and_submission_follow_transaction_order(self):
-        disable = lambda: self.manage('disable_user', str(self.voter.pk))
-        submit = lambda: self.submit([self.candidates[1].pk])
-        for disable_first in (True, False):
-            with self.subTest(disable_first=disable_first):
-                self.manage('enable_user', str(self.voter.pk))
-                ballot = self.submit([self.candidates[0].pk])
-                held, attempted, release = threading.Event(), threading.Event(), threading.Event()
-                first, second = (disable, submit) if disable_first else (submit, disable)
-                def hold_first():
-                    connections.close_all()
-                    try:
-                        with transaction.atomic():
-                            first()
-                            held.set()
-                            if not release.wait(10):
-                                raise AssertionError('Timed out waiting to release transaction')
-                    finally:
-                        connections.close_all()
-                def run_second():
-                    connection = connections['default']
-                    def observe_begin(execute, sql, params, many, context):
-                        if sql == 'BEGIN IMMEDIATE':
-                            attempted.set()
-                        return execute(sql, params, many, context)
-                    try:
-                        with connection.execute_wrapper(observe_begin):
-                            try:
-                                second()
-                                return 'ok'
-                            except ValidationError:
-                                return 'rejected'
-                    finally:
-                        connection.close()
-                with ThreadPoolExecutor(max_workers=2) as pool:
-                    first_future = pool.submit(hold_first)
-                    try:
-                        self.assertTrue(held.wait(10))
-                        second_future = pool.submit(run_second)
-                        self.assertTrue(attempted.wait(10))
-                    finally:
-                        release.set()
-                    first_future.result(timeout=10)
-                    self.assertEqual(second_future.result(timeout=10), 'rejected' if disable_first else 'ok')
-                self.voter.refresh_from_db()
-                self.assertFalse(self.voter.is_active)
-                self.assertEqual(list(ballot.choices.all()), [self.candidates[0 if disable_first else 1]])
 
     def test_real_sqlite_lock_timeout_preserves_ballot(self):
         self.submit([self.candidates[0].pk])

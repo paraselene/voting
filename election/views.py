@@ -80,12 +80,11 @@ def vote(request):
             return redirect('vote')
     with transaction.atomic():
         election = Election.objects.order_by('-pk').first()
-        request.identity.refresh_from_db(fields=['is_active'])
         ballot = Ballot.objects.filter(election=election, voter=request.identity).first()
         selected = set(ballot.choices.values_list('pk', flat=True)) if ballot else set()
         candidates = list(election.candidates.all()) if election else []
         request.identity.display_number = voter_numbers()[request.identity.pk]
-    if error and election and str(election.pk) == request.POST.get('election_id') and str(election.version) == request.POST.get('version') and election.is_open and request.identity.is_active:
+    if error and election and str(election.pk) == request.POST.get('election_id') and str(election.version) == request.POST.get('version') and election.is_open:
         selected = {int(value) for value in request.POST.getlist('candidate') if value.isdecimal() and len(value) < 12}
     return render(request, 'election/vote.html', {'identity': request.identity, 'election': election, 'ballot': ballot, 'selected': selected, 'candidates': candidates, 'error': error})
 
@@ -96,8 +95,7 @@ def dashboard(request):
     if request.method == 'POST':
         try:
             action = request.POST.get('action')
-            field = 'target' if action in ('enable_user', 'disable_user') else 'confirmation'
-            manage_election(action, request.POST.get(field, ''), election_id=request.POST.get('election_id'), version=request.POST.get('version'), title=request.POST.get('title', ''), selected=request.POST.getlist('candidate'), maximum=request.POST.get('maximum'))
+            manage_election(action, request.POST.get('confirmation', ''), election_id=request.POST.get('election_id'), version=request.POST.get('version'), title=request.POST.get('title', ''), selected=request.POST.getlist('candidate'), maximum=request.POST.get('maximum'))
         except ValidationError as exc:
             messages.error(request, ' '.join(exc.messages))
         else:
@@ -130,15 +128,9 @@ def dashboard(request):
 @access(admin=True)
 @require_POST
 def credentials(request):
-    users = Identity.objects.filter(is_admin=False)
-    if request.POST.get('scope') != 'all':
-        ids = request.POST.getlist('users')
-        if any(not value.isdecimal() or len(value) > 12 for value in ids):
-            return render(request, 'election/error.html', {'error': '用戶資料無效。'}, status=400)
-        users = users.filter(pk__in=ids)
-    users = list(users)
+    users = list(Identity.objects.filter(is_admin=False))
     if not users:
-        messages.error(request, '請至少選擇一位用戶。')
+        messages.error(request, '尚未建立用戶，請先初始化資料。')
         return redirect('dashboard')
     try:
         data = credential_pdf(users)

@@ -117,7 +117,7 @@ print(json.dumps({'admin': password, 'users': users, 'candidates': list(Candidat
     print(f'HTTP login + vote: 18 users / 10 concurrent clients in {time.monotonic() - start:.2f}s')
     pdf_dir = ROOT / 'tmp/pdfs'
     pdf_dir.mkdir(parents=True, exist_ok=True)
-    status, pdf, headers = admin.request('/credentials/', [('scope', 'all')])
+    status, pdf, headers = admin.request('/credentials/', [])
     assert status == 200 and pdf.startswith(b'%PDF') and 'no-store' in headers['Cache-Control']
     (pdf_dir / 'docker-credentials.pdf').write_bytes(pdf)
     from pypdf import PdfReader

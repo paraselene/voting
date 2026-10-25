@@ -67,8 +67,6 @@ def submit_ballot(voter, selected, election_id, version, blank_confirmed=False):
         raise ValidationError('用戶資料無效。')
     if voter.is_admin:
         raise ValidationError('管理員不能投票。')
-    if not voter.is_active:
-        raise ValidationError('你的投票權限已停用，仍可查看已提交的選票。')
     if not election.is_open:
         raise ValidationError('投票已關閉，未更改選票。')
     try:
@@ -135,14 +133,6 @@ def manage_election(action, value='', *, election_id=None, version=None, title='
             raise ValidationError('請選擇 1 至 19 位候選人，上限須為 1 至候選人人數。')
         election = Election.objects.create(title=title, max_votes=limit, is_open=True)
         election.candidates.set(ids)
-    elif action in ('enable_user', 'disable_user'):
-        if not value.isdecimal() or len(value) > 12:
-            raise ValidationError('啟用／停用對象無效。')
-        target = Identity.objects.filter(pk=value, is_admin=False).first()
-        if target is None:
-            raise ValidationError('啟用／停用對象無效，管理員帳戶不能停用。')
-        target.is_active = action == 'enable_user'
-        target.save(update_fields=['is_active'])
     elif action == 'reset':
         if value != '清除全部資料':
             raise ValidationError('請確認「清除全部資料」操作。')

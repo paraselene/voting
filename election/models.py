@@ -8,6 +8,7 @@ class Identity(models.Model):
     name = models.CharField(max_length=80, blank=True)
     number = models.PositiveSmallIntegerField(null=True, unique=True)
     is_admin = models.BooleanField(default=False)
+    # shortcut: unused status column preserves existing databases; drop on the next schema reset.
     is_active = models.BooleanField(default=True)
     password_index = models.CharField(max_length=64, unique=True)
     encrypted_password = models.TextField(blank=True)
